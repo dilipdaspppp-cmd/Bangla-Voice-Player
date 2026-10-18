@@ -77,6 +77,95 @@
             android:textSize="18sp"
             android:visibility="gone" />
 
+        <LinearLayout
+            android:id="@+id/fsBar"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_gravity="bottom"
+            android:clickable="true"
+            android:orientation="vertical"
+            android:paddingLeft="24dp"
+            android:paddingTop="28dp"
+            android:paddingRight="24dp"
+            android:paddingBottom="12dp"
+            android:visibility="gone">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <TextView
+                    android:id="@+id/fsCur"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:minWidth="52dp"
+                    android:text="০০:০০"
+                    android:textColor="@color/white"
+                    android:textSize="13sp" />
+
+                <SeekBar
+                    android:id="@+id/fsSeek"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:minHeight="36dp"
+                    android:progressBackgroundTint="@color/white"
+                    android:progressTint="@color/accent"
+                    android:thumbTint="@color/accent" />
+
+                <TextView
+                    android:id="@+id/fsDur"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:gravity="end"
+                    android:minWidth="52dp"
+                    android:text="০০:০০"
+                    android:textColor="@color/white"
+                    android:textSize="13sp" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:gravity="center"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/fsBack"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_marginRight="8dp"
+                    android:layout_weight="1"
+                    android:text="⏪ ১০" />
+
+                <Button
+                    android:id="@+id/fsPlay"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_marginRight="8dp"
+                    android:layout_weight="1.3"
+                    android:text="▶" />
+
+                <Button
+                    android:id="@+id/fsFwd"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_marginRight="8dp"
+                    android:layout_weight="1"
+                    android:text="১০ ⏩" />
+
+                <Button
+                    android:id="@+id/fsSubs"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_weight="1"
+                    android:text="💬" />
+            </LinearLayout>
+        </LinearLayout>
+
         <TextView
             android:id="@+id/exitFull"
             android:layout_width="44dp"
@@ -248,10 +337,21 @@
                 <TextView
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:text="🔊 কণ্ঠ"
+                    android:text="🔊 কণ্ঠ ও সাবটাইটেল"
                     android:textColor="@color/text"
                     android:textSize="16sp"
                     android:textStyle="bold" />
+
+                <Switch
+                    android:id="@+id/subsSwitch"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:checked="true"
+                    android:minHeight="48dp"
+                    android:text="💬 স্ক্রিনে সাবটাইটেলের লেখা দেখান"
+                    android:textColor="@color/text"
+                    android:textSize="14sp" />
 
                 <FrameLayout
                     android:id="@+id/voiceBox"
@@ -343,7 +443,7 @@
                 android:layout_height="wrap_content"
                 android:layout_marginTop="10dp"
                 android:gravity="center"
-                android:text="ভিডিওতে এক ট্যাপ = চালান/থামান · দুই ট্যাপ = ফুলস্ক্রিন · ডানে সোয়াইপ = পরের লাইন · বামে সোয়াইপ = আগের লাইন"
+                android:text="ভিডিওতে এক ট্যাপ = চালান/থামান (ফুলস্ক্রিনে কন্ট্রোল দেখান/লুকান) · দুই ট্যাপ = ফুলস্ক্রিন · ডানে সোয়াইপ = পরের লাইন · বামে সোয়াইপ = আগের লাইন"
                 android:textColor="@color/textDim"
                 android:textSize="12sp" />
         </LinearLayout>
