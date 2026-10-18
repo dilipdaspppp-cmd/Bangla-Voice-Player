@@ -280,8 +280,8 @@ class MainActivity : Activity() {
         tts = TextToSpeech(this, TextToSpeech.OnInitListener { status ->
             runOnUiThread { onTtsInit(status) }
         }, "com.google.android.tts")
-        restoreLastSession()
-        handler.post(tickRunnable)
+        // প্রতিবার অ্যাপ খুললে নতুন করে শুরু: আগের ভিডিও/সাবটাইটেল মনে রাখা হবে না
+        prefs.edit().remove("video").remove("srt").remove("pos").apply()
     }
 
     private fun bindViews() {
@@ -590,7 +590,63 @@ class MainActivity : Activity() {
     }
 
     override fun onBackPressed() {
-        if (isFullscreen) toggleFullscreen() else super.onBackPressed()
+        if (isFullscreen) {
+            toggleFullscreen()
+            return
+        }
+        showExitDialog()
+    }
+
+    // ব্যাক চাপলে অ্যাপ বন্ধ করার অপশন
+    private fun showExitDialog() {
+        AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+            .setTitle("🚪 অ্যাপ বন্ধ করবেন?")
+            .setMessage("অ্যাপ পুরোপুরি বন্ধ হয়ে যাবে, ব্যাকগ্রাউন্ডে কিছুই চলবে না। পরের বার খুললে নতুন করে ভিডিও আর সাবটাইটেল বেছে নিতে হবে।")
+            .setPositiveButton("বন্ধ করুন") { _, _ -> exitApp() }
+            .setNegativeButton("না, থাকি", null)
+            .show()
+    }
+
+    private var released = false
+
+    // সব কিছু থামিয়ে মেমোরি খালি করা (একবারই চলে)
+    private fun releaseAll() {
+        if (released) return
+        released = true
+        handler.removeCallbacksAndMessages(null)
+        pickerToken++
+        finishSpeaking()
+        if (::player.isInitialized) {
+            try {
+                player.stop()
+                player.release()
+            } catch (e: Exception) {
+            }
+        }
+        try {
+            executor.shutdownNow()
+        } catch (e: Exception) {
+        }
+        for (l in latches.values) l.countDown()
+        try {
+            tts?.stop()
+            tts?.shutdown()
+        } catch (e: Exception) {
+        }
+        tts = null
+        cache.clear()
+        cleanOldAudioFiles()
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    }
+
+    // অ্যাপ সম্পূর্ণ বন্ধ: সাম্প্রতিক অ্যাপের তালিকা থেকেও সরে যাবে
+    private fun exitApp() {
+        prefs.edit().remove("video").remove("srt").remove("pos").commit()
+        releaseAll()
+        finishAndRemoveTask()
+        Handler(Looper.getMainLooper()).postDelayed({
+            android.os.Process.killProcess(android.os.Process.myPid())
+        }, 400L)
     }
 
     // ================= ভিডিও প্লেয়ার =================
@@ -1308,27 +1364,6 @@ class MainActivity : Activity() {
         return true
     }
 
-    private fun restoreLastSession() {
-        val srt = prefs.getString("srt", null)
-        if (srt != null) {
-            try {
-                if (!loadSrt(Uri.parse(srt))) prefs.edit().remove("srt").apply()
-            } catch (e: Exception) {
-                prefs.edit().remove("srt").apply()
-            }
-        }
-        val video = prefs.getString("video", null)
-        if (video != null) {
-            try {
-                val uri = Uri.parse(video)
-                contentResolver.openInputStream(uri)?.close()
-                loadVideo(uri, prefs.getLong("pos", 0L))
-            } catch (e: Exception) {
-                prefs.edit().remove("video").apply()
-            }
-        }
-    }
-
     // ================= SRT পড়া =================
 
     private fun decodeText(bytes: ByteArray): String {
@@ -2001,32 +2036,24 @@ class MainActivity : Activity() {
         }
     }
 
-    override fun onPause() {
-        super.onPause()
-        if (::player.isInitialized && player.mediaItemCount > 0) {
-            prefs.edit().putLong("pos", player.currentPosition).apply()
+    // অ্যাপ সামনে এলে সিঙ্ক ইঞ্জিন চালু
+    override fun onStart() {
+        super.onStart()
+        if (!released) {
+            handler.removeCallbacks(tickRunnable)
+            handler.post(tickRunnable)
         }
     }
 
+    // হোম চাপলে বা অন্য অ্যাপে গেলে ভিডিও থামে আর সিঙ্ক ইঞ্জিন ঘুমায়, ব্যাটারি খরচ হয় না
     override fun onStop() {
         super.onStop()
-        if (::player.isInitialized) player.pause()
+        if (::player.isInitialized && !released) player.pause()
+        handler.removeCallbacks(tickRunnable)
     }
 
     override fun onDestroy() {
-        handler.removeCallbacksAndMessages(null)
-        finishSpeaking()
-        if (::player.isInitialized) player.release()
-        try {
-            executor.shutdownNow()
-        } catch (e: Exception) {
-        }
-        for (l in latches.values) l.countDown()
-        try {
-            tts?.stop()
-            tts?.shutdown()
-        } catch (e: Exception) {
-        }
+        releaseAll()
         super.onDestroy()
     }
 }
