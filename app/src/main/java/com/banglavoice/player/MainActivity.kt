@@ -1,7 +1,22 @@
 package com.banglavoice.player
 
+import android.Manifest
 import android.app.Activity
+import android.app.AlertDialog
+import android.app.Dialog
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Environment
+import android.provider.MediaStore
+import android.text.Editable
+import android.text.TextUtils
+import android.text.TextWatcher
+import android.widget.BaseAdapter
+import android.widget.EditText
+import android.widget.ListView
+import android.widget.Switch
+import java.text.SimpleDateFormat
+import java.util.Date
 import android.content.SharedPreferences
 import android.content.pm.ActivityInfo
 import android.content.res.ColorStateList
@@ -88,6 +103,20 @@ class Speaking(
     var lastMoveAt: Long
 )
 
+// ফোনে খুঁজে পাওয়া একটি ভিডিও বা SRT ফাইল
+class MediaFile(
+    val path: String,
+    val name: String,
+    val folder: String,
+    val size: Long,
+    val modified: Long,
+    val durationMs: Long
+) {
+    var match = false
+}
+
+class DirNode(val dir: File, val depth: Int)
+
 class SimpleSeek(
     private val onChange: (Int, Boolean) -> Unit,
     private val onStart: () -> Unit,
@@ -111,6 +140,13 @@ class MainActivity : Activity() {
     companion object {
         const val REQ_VIDEO = 11
         const val REQ_SRT = 12
+        const val REQ_PERM = 13
+        const val PICK_VIDEO = 1
+        const val PICK_SRT = 2
+        val VIDEO_EXT = setOf(
+            "mp4", "mkv", "webm", "3gp", "3g2", "mov", "m4v", "avi", "ts", "m2ts",
+            "mts", "flv", "wmv", "mpg", "mpeg", "vob", "ogv"
+        )
         const val AHEAD = 6              // সামনের কয়টি লাইনের কণ্ঠ আগাম তৈরি থাকবে
         const val MARGIN_MS = 120L       // দুই লাইনের কণ্ঠের মাঝে ন্যূনতম বিরতি
         const val MIN_SPEED = 0.1f       // ভিডিও সর্বনিম্ন এই গতিতে চলবে, কখনো থামবে না
@@ -158,6 +194,11 @@ class MainActivity : Activity() {
     private var videoH = 0
     private var statusMsg = ""
     private var statusMsgUntil = 0L
+    private var showSubs = true
+    private var fsBarVisible = false
+    private var pendingPick = 0
+    private var pickerToken = 0
+    private var currentVideoBase = ""
 
     private lateinit var root: LinearLayout
     private lateinit var header: LinearLayout
@@ -190,6 +231,19 @@ class MainActivity : Activity() {
     private lateinit var warnText: TextView
     private lateinit var btnInstall: Button
     private lateinit var statusText: TextView
+    private lateinit var subsSwitch: Switch
+    private lateinit var fsBar: LinearLayout
+    private lateinit var fsCur: TextView
+    private lateinit var fsDur: TextView
+    private lateinit var fsSeek: SeekBar
+    private lateinit var fsBack: Button
+    private lateinit var fsPlay: Button
+    private lateinit var fsFwd: Button
+    private lateinit var fsSubs: Button
+
+    private val hideBarRunnable = Runnable {
+        if (isFullscreen && ::player.isInitialized && player.isPlaying && !userSeeking) setFsBar(false)
+    }
 
     private val tickRunnable = object : Runnable {
         override fun run() {
@@ -216,6 +270,9 @@ class MainActivity : Activity() {
         speedSeek.progress = ((baseRate - 0.7f) * 100f).roundToInt()
         duckSeek.progress = (duckLevel * 100f).roundToInt()
         updateSliderLabels()
+        showSubs = prefs.getBoolean("showSubs", true)
+        subsSwitch.isChecked = showSubs
+        fsSubs.alpha = if (showSubs) 1f else 0.45f
         setupPlayer()
         setupControls()
         setupGestures()
@@ -259,6 +316,15 @@ class MainActivity : Activity() {
         warnText = findViewById<TextView>(R.id.warnText)!!
         btnInstall = findViewById<Button>(R.id.btnInstall)!!
         statusText = findViewById<TextView>(R.id.statusText)!!
+        subsSwitch = findViewById<Switch>(R.id.subsSwitch)!!
+        fsBar = findViewById<LinearLayout>(R.id.fsBar)!!
+        fsCur = findViewById<TextView>(R.id.fsCur)!!
+        fsDur = findViewById<TextView>(R.id.fsDur)!!
+        fsSeek = findViewById<SeekBar>(R.id.fsSeek)!!
+        fsBack = findViewById<Button>(R.id.fsBack)!!
+        fsPlay = findViewById<Button>(R.id.fsPlay)!!
+        fsFwd = findViewById<Button>(R.id.fsFwd)!!
+        fsSubs = findViewById<Button>(R.id.fsSubs)!!
     }
 
     // ================= ডিজাইন =================
@@ -300,6 +366,23 @@ class MainActivity : Activity() {
         subtitleView.background = rounded(0xB3000000.toInt(), 10f)
         exitFull.background = rounded(0x80000000.toInt(), 22f)
         voiceSpinner.backgroundTintList = ColorStateList.valueOf(Color.WHITE)
+
+        // ফুলস্ক্রিনের নিচের কন্ট্রোল বার
+        val fade = GradientDrawable(
+            GradientDrawable.Orientation.BOTTOM_TOP,
+            intArrayOf(0xE6000000.toInt(), 0x99000000.toInt(), 0x00000000)
+        )
+        fsBar.background = fade
+        val glass = 0x33FFFFFF
+        styleButton(fsBack, glass)
+        styleButton(fsPlay, primary)
+        styleButton(fsFwd, glass)
+        styleButton(fsSubs, glass)
+
+        // সাবটাইটেল সুইচের রঙ
+        val states = arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf())
+        subsSwitch.thumbTintList = ColorStateList(states, intArrayOf(getColor(R.color.accent), 0xFFCBD5E1.toInt()))
+        subsSwitch.trackTintList = ColorStateList(states, intArrayOf(0x992DD4BF.toInt(), 0x6694A3B8))
     }
 
     private fun bn(s: String): String {
@@ -439,7 +522,6 @@ class MainActivity : Activity() {
         if (isFullscreen) {
             header.visibility = View.GONE
             panel.visibility = View.GONE
-            exitFull.visibility = View.VISIBLE
             root.setPadding(0, 0, 0, 0)
             subtitleView.textSize = 22f
             requestedOrientation = if (videoW > 0 && videoW < videoH) {
@@ -448,16 +530,58 @@ class MainActivity : Activity() {
                 ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
             }
             hideSystemBars()
+            setFsBar(true)
         } else {
             header.visibility = View.VISIBLE
             panel.visibility = View.VISIBLE
-            exitFull.visibility = View.GONE
             subtitleView.textSize = 18f
             requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
             showSystemBars()
+            setFsBar(false)
         }
         root.requestApplyInsets()
         handler.post { applyLayout() }
+    }
+
+    // ফুলস্ক্রিনের নিচের কন্ট্রোল বার (ভিডিও টানার লাইন সহ) দেখানো বা লুকানো
+    private fun setFsBar(show: Boolean) {
+        handler.removeCallbacks(hideBarRunnable)
+        if (show && isFullscreen) {
+            fsBarVisible = true
+            fsBar.visibility = View.VISIBLE
+            exitFull.visibility = View.VISIBLE
+            updateTimeUi(player.currentPosition)
+            fsBar.post {
+                if (fsBarVisible) subtitleView.animate().translationY(-fsBar.height.toFloat()).setDuration(150L).start()
+            }
+            handler.postDelayed(hideBarRunnable, 3500L)
+        } else {
+            fsBarVisible = false
+            fsBar.visibility = View.GONE
+            exitFull.visibility = View.GONE
+            subtitleView.animate().translationY(0f).setDuration(150L).start()
+        }
+    }
+
+    // কন্ট্রোল ব্যবহার করলে লুকানোর সময় আবার নতুন করে গোনা
+    private fun bumpFsBar() {
+        if (isFullscreen && fsBarVisible) {
+            handler.removeCallbacks(hideBarRunnable)
+            handler.postDelayed(hideBarRunnable, 3500L)
+        }
+    }
+
+    // স্ক্রিনে সাবটাইটেলের লেখা দেখানো চালু/বন্ধ (কণ্ঠ সবসময় চলবে)
+    private fun setShowSubs(v: Boolean) {
+        if (showSubs != v) {
+            showSubs = v
+            prefs.edit().putBoolean("showSubs", v).apply()
+            flash(if (v) "💬 স্ক্রিনে সাবটাইটেল দেখানো হবে" else "💬 সাবটাইটেল লুকানো হয়েছে, কণ্ঠ চলতে থাকবে")
+        }
+        if (subsSwitch.isChecked != v) subsSwitch.isChecked = v
+        fsSubs.alpha = if (v) 1f else 0.45f
+        lastShownIdx = -2
+        if (::player.isInitialized) updateSubtitleView(player.currentPosition)
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -481,6 +605,7 @@ class MainActivity : Activity() {
 
             override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
                 btnPlay.text = if (playWhenReady) "⏸  থামান" else "▶  চালান"
+                fsPlay.text = if (playWhenReady) "⏸" else "▶"
             }
 
             override fun onPlaybackStateChanged(playbackState: Int) {
@@ -511,6 +636,7 @@ class MainActivity : Activity() {
     private fun onPlayingChanged(isPlaying: Boolean) {
         val sp = speaking
         if (isPlaying) {
+            bumpFsBar()
             window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             if (sp != null) {
                 sp.lastMoveAt = SystemClock.uptimeMillis()
@@ -581,7 +707,7 @@ class MainActivity : Activity() {
             override fun onDown(e: MotionEvent): Boolean = true
 
             override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
-                togglePlay()
+                if (isFullscreen) setFsBar(!fsBarVisible) else togglePlay()
                 return true
             }
 
@@ -602,6 +728,9 @@ class MainActivity : Activity() {
             }
         })
         videoBox.setOnTouchListener { _, ev -> detector.onTouchEvent(ev) }
+        fsBar.addOnLayoutChangeListener { _, _, t, _, b, _, ot, _, ob ->
+            if (fsBarVisible && b - t != ob - ot) subtitleView.translationY = -fsBar.height.toFloat()
+        }
     }
 
     // ================= বোতাম ও স্লাইডার =================
@@ -612,9 +741,41 @@ class MainActivity : Activity() {
         btnFwd.setOnClickListener { seekToMs(player.currentPosition + 10000L) }
         btnFull.setOnClickListener { toggleFullscreen() }
         exitFull.setOnClickListener { toggleFullscreen() }
-        btnVideo.setOnClickListener { pickFile(REQ_VIDEO, "video/*") }
-        btnSrt.setOnClickListener { pickFile(REQ_SRT, "*/*") }
+        btnVideo.setOnClickListener { requestPick(PICK_VIDEO) }
+        btnSrt.setOnClickListener { requestPick(PICK_SRT) }
         btnInstall.setOnClickListener { openVoiceInstall() }
+
+        subsSwitch.setOnCheckedChangeListener { _, checked -> setShowSubs(checked) }
+        fsSubs.setOnClickListener {
+            setShowSubs(!showSubs)
+            bumpFsBar()
+        }
+        fsPlay.setOnClickListener {
+            togglePlay()
+            bumpFsBar()
+        }
+        fsBack.setOnClickListener {
+            seekToMs(player.currentPosition - 10000L)
+            bumpFsBar()
+        }
+        fsFwd.setOnClickListener {
+            seekToMs(player.currentPosition + 10000L)
+            bumpFsBar()
+        }
+        fsSeek.setOnSeekBarChangeListener(SimpleSeek(
+            { p, fromUser ->
+                if (fromUser) fsCur.text = formatTime(p.toLong())
+            },
+            {
+                userSeeking = true
+                handler.removeCallbacks(hideBarRunnable)
+            },
+            { p ->
+                userSeeking = false
+                seekToMs(p.toLong())
+                bumpFsBar()
+            }
+        ))
 
         seekBar.setOnSeekBarChangeListener(SimpleSeek(
             { p, fromUser ->
@@ -678,6 +839,416 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun systemPick(kind: Int) {
+        if (kind == PICK_VIDEO) pickFile(REQ_VIDEO, "video/*")
+        else if (kind == PICK_SRT) pickFile(REQ_SRT, "*/*")
+    }
+
+    // ================= মোবাইলের সব ভিডিও / সব SRT এর তালিকা =================
+
+    private fun hasStorageAccess(): Boolean {
+        return if (Build.VERSION.SDK_INT >= 30) {
+            Environment.isExternalStorageManager()
+        } else {
+            checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+        }
+    }
+
+    private fun requestPick(kind: Int) {
+        if (hasStorageAccess()) {
+            openPicker(kind)
+            return
+        }
+        pendingPick = kind
+        val msg = if (Build.VERSION.SDK_INT >= 30) {
+            "মোবাইলের সব ভিডিও আর সব সাবটাইটেল একসাথে তালিকায় দেখাতে অ্যাপের ফাইল দেখার অনুমতি লাগবে।" + NL + NL +
+                "পরের পাতায় বাংলা ভয়েস প্লেয়ার এর পাশের সুইচটা চালু করুন (Allow access to manage all files), তারপর Back চাপুন।" + NL + NL +
+                "অ্যাপ কোনো ফাইল মুছবে বা বদলাবে না, শুধু খুঁজে দেখাবে।"
+        } else {
+            "মোবাইলের সব ভিডিও আর সব সাবটাইটেল একসাথে তালিকায় দেখাতে অ্যাপের ফাইল দেখার অনুমতি লাগবে। পরের বার্তায় Allow চাপুন।"
+        }
+        AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+            .setTitle("📂 ফাইল দেখার অনুমতি")
+            .setMessage(msg)
+            .setPositiveButton("অনুমতি দিন") { _, _ -> askStorageAccess() }
+            .setNegativeButton("নিজে খুঁজব") { _, _ ->
+                val k = pendingPick
+                pendingPick = 0
+                systemPick(k)
+            }
+            .setOnCancelListener { pendingPick = 0 }
+            .show()
+    }
+
+    private fun askStorageAccess() {
+        if (Build.VERSION.SDK_INT >= 30) {
+            try {
+                startActivity(Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:" + packageName)))
+            } catch (e: Exception) {
+                try {
+                    startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+                } catch (e2: Exception) {
+                    val k = pendingPick
+                    pendingPick = 0
+                    systemPick(k)
+                }
+            }
+        } else {
+            requestPermissions(arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE), REQ_PERM)
+        }
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode != REQ_PERM) return
+        val k = pendingPick
+        pendingPick = 0
+        if (k == 0) return
+        if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            openPicker(k)
+        } else {
+            flash("অনুমতি দেওয়া হয়নি, তাই নিজে ফাইল খুঁজে নিন।")
+            systemPick(k)
+        }
+    }
+
+    private fun formatSize(bytes: Long): String {
+        val mb = bytes / (1024.0 * 1024.0)
+        val s = if (mb >= 1024.0) String.format(Locale.US, "%.1f GB", mb / 1024.0)
+        else if (mb >= 1.0) String.format(Locale.US, "%.1f MB", mb)
+        else String.format(Locale.US, "%d KB", max(1L, bytes / 1024L))
+        return bn(s)
+    }
+
+    private fun queryVideoStore(out: MutableMap<String, MediaFile>) {
+        val uri = if (Build.VERSION.SDK_INT >= 29) {
+            MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
+        } else {
+            MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+        }
+        val proj = arrayOf(
+            MediaStore.MediaColumns.DATA,
+            MediaStore.MediaColumns.DISPLAY_NAME,
+            MediaStore.MediaColumns.SIZE,
+            MediaStore.MediaColumns.DATE_MODIFIED,
+            MediaStore.Video.VideoColumns.DURATION
+        )
+        contentResolver.query(uri, proj, null, null, null)?.use { c ->
+            while (c.moveToNext()) {
+                val path = c.getString(0) ?: continue
+                val f = File(path)
+                if (!f.exists()) continue
+                val name = c.getString(1) ?: f.name
+                out[path] = MediaFile(path, name, f.parentFile?.name ?: "", c.getLong(2), c.getLong(3) * 1000L, c.getLong(4))
+            }
+        }
+    }
+
+    private fun querySrtStore(out: MutableMap<String, MediaFile>) {
+        val uri = if (Build.VERSION.SDK_INT >= 29) {
+            MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL)
+        } else {
+            MediaStore.Files.getContentUri("external")
+        }
+        val proj = arrayOf(MediaStore.MediaColumns.DATA, MediaStore.MediaColumns.SIZE, MediaStore.MediaColumns.DATE_MODIFIED)
+        contentResolver.query(uri, proj, MediaStore.MediaColumns.DATA + " LIKE ?", arrayOf("%.srt"), null)?.use { c ->
+            while (c.moveToNext()) {
+                val path = c.getString(0) ?: continue
+                val f = File(path)
+                if (!f.exists()) continue
+                out[path] = MediaFile(path, f.name, f.parentFile?.name ?: "", c.getLong(1), c.getLong(2) * 1000L, 0L)
+            }
+        }
+    }
+
+    // পুরো মোবাইল (এবং মেমোরি কার্ড) ঘুরে ফাইল খোঁজা, যাতে একটাও বাদ না যায়
+    private fun walkStorage(isVideo: Boolean, out: MutableMap<String, MediaFile>, token: Int) {
+        val roots = LinkedHashSet<String>()
+        roots.add(Environment.getExternalStorageDirectory().absolutePath)
+        try {
+            for (d in getExternalFilesDirs(null)) {
+                if (d == null) continue
+                val p = d.absolutePath
+                val i = p.indexOf("/Android/")
+                if (i > 0) roots.add(p.substring(0, i))
+            }
+        } catch (e: Exception) {
+        }
+        val stack = java.util.ArrayDeque<DirNode>()
+        for (r in roots) stack.push(DirNode(File(r), 0))
+        var visited = 0
+        while (!stack.isEmpty() && visited < 400000) {
+            if (token != pickerToken) return
+            val node = stack.pop()
+            val children = node.dir.listFiles() ?: continue
+            for (c in children) {
+                visited++
+                val name = c.name
+                if (c.isDirectory) {
+                    if (node.depth >= 16 || name.startsWith(".")) continue
+                    if (node.dir.name == "Android" && (name == "data" || name == "obb")) continue
+                    stack.push(DirNode(c, node.depth + 1))
+                } else {
+                    val ext = name.substringAfterLast('.', "").lowercase(Locale.US)
+                    val ok = if (isVideo) ext in VIDEO_EXT else ext == "srt"
+                    if (ok && !out.containsKey(c.absolutePath)) {
+                        out[c.absolutePath] = MediaFile(c.absolutePath, name, node.dir.name, c.length(), c.lastModified(), 0L)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun srtMatchesVideo(srtName: String): Boolean {
+        val v = currentVideoBase
+        if (v.isEmpty()) return false
+        val s = srtName.substringBeforeLast('.').lowercase(Locale.US).trim()
+        if (s == v) return true
+        for (sep in listOf(".", "_", " ", "-", "(", "[")) {
+            if (s.startsWith(v + sep)) return true
+        }
+        return false
+    }
+
+    inner class FileAdapter(private val isVideo: Boolean) : BaseAdapter() {
+        var items: List<MediaFile> = emptyList()
+        private val dateFmt = SimpleDateFormat("dd/MM/yyyy", Locale.US)
+
+        override fun getCount(): Int = items.size
+        override fun getItem(position: Int): Any = items[position]
+        override fun getItemId(position: Int): Long = position.toLong()
+
+        override fun getView(position: Int, convertView: View?, parent: ViewGroup?): View {
+            val row = (convertView as? LinearLayout) ?: makeRow()
+            val t1 = row.getChildAt(0) as TextView
+            val t2 = row.getChildAt(1) as TextView
+            val f = items[position]
+            val icon = if (f.match) "⭐ " else if (isVideo) "🎬 " else "📄 "
+            t1.text = icon + f.name
+            val parts = ArrayList<String>()
+            if (f.match) parts.add("এই ভিডিওর সাথে মিলে")
+            parts.add("📁 " + f.folder)
+            if (f.durationMs > 0L) parts.add("⏱ " + formatTime(f.durationMs))
+            parts.add(formatSize(f.size))
+            if (f.modified > 0L) parts.add(bn(dateFmt.format(Date(f.modified))))
+            t2.text = parts.joinToString("  ·  ")
+            return row
+        }
+
+        private fun makeRow(): LinearLayout {
+            val row = LinearLayout(this@MainActivity)
+            row.orientation = LinearLayout.VERTICAL
+            val ph = dp(18f).toInt()
+            val pv = dp(12f).toInt()
+            row.setPadding(ph, pv, ph, pv)
+            val t1 = TextView(this@MainActivity)
+            t1.setTextColor(getColor(R.color.text))
+            t1.textSize = 15f
+            t1.maxLines = 2
+            t1.ellipsize = TextUtils.TruncateAt.END
+            val t2 = TextView(this@MainActivity)
+            t2.setTextColor(getColor(R.color.textDim))
+            t2.textSize = 12.5f
+            t2.maxLines = 1
+            t2.ellipsize = TextUtils.TruncateAt.MIDDLE
+            t2.setPadding(0, dp(3f).toInt(), 0, 0)
+            row.addView(t1)
+            row.addView(t2)
+            return row
+        }
+    }
+
+    private fun openPicker(kind: Int) {
+        val isVideo = kind == PICK_VIDEO
+        val token = ++pickerToken
+        val bg = getColor(R.color.bg)
+        val textC = getColor(R.color.text)
+        val dimC = getColor(R.color.textDim)
+        val surface2 = getColor(R.color.surface2)
+        val pad = dp(16f).toInt()
+
+        val dlg = Dialog(this, android.R.style.Theme_Material_NoActionBar)
+        val box = LinearLayout(this)
+        box.orientation = LinearLayout.VERTICAL
+        box.setBackgroundColor(bg)
+
+        val head = LinearLayout(this)
+        head.orientation = LinearLayout.HORIZONTAL
+        head.gravity = Gravity.CENTER_VERTICAL
+        head.setPadding(pad, pad, pad / 2, pad / 2)
+        val title = TextView(this)
+        title.text = if (isVideo) "🎬 মোবাইলের সব ভিডিও" else "📄 মোবাইলের সব সাবটাইটেল (SRT)"
+        title.setTextColor(textC)
+        title.textSize = 19f
+        title.setTypeface(title.typeface, android.graphics.Typeface.BOLD)
+        title.layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        val close = TextView(this)
+        close.text = "✕"
+        close.setTextColor(textC)
+        close.textSize = 22f
+        close.gravity = Gravity.CENTER
+        close.layoutParams = LinearLayout.LayoutParams(dp(48f).toInt(), dp(48f).toInt())
+        close.setOnClickListener { dlg.dismiss() }
+        head.addView(title)
+        head.addView(close)
+
+        val search = EditText(this)
+        search.hint = "🔍 নাম লিখে খুঁজুন"
+        search.setHintTextColor(dimC)
+        search.setTextColor(textC)
+        search.textSize = 15f
+        search.setSingleLine(true)
+        search.background = rounded(surface2, 12f)
+        search.setPadding(pad, dp(12f).toInt(), pad, dp(12f).toInt())
+        val slp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        slp.setMargins(pad, 0, pad, 0)
+        search.layoutParams = slp
+
+        val info = TextView(this)
+        info.text = "⏳ মোবাইলে খুঁজছি…"
+        info.setTextColor(dimC)
+        info.textSize = 13f
+        info.setPadding(pad + dp(2f).toInt(), dp(10f).toInt(), pad, dp(4f).toInt())
+
+        val list = ListView(this)
+        list.divider = null
+        list.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+        val adapter = FileAdapter(isVideo)
+        list.adapter = adapter
+
+        val other = Button(this)
+        other.text = "📁 তালিকায় নেই? অন্য জায়গা থেকে খুঁজুন"
+        styleButton(other, surface2)
+        val olp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(50f).toInt())
+        olp.setMargins(pad, dp(8f).toInt(), pad, pad)
+        other.layoutParams = olp
+        other.setOnClickListener {
+            dlg.dismiss()
+            systemPick(kind)
+        }
+
+        box.addView(head)
+        box.addView(search)
+        box.addView(info)
+        box.addView(list)
+        box.addView(other)
+        dlg.setContentView(box)
+
+        val w = dlg.window
+        if (w != null) {
+            w.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+            w.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE or WindowManager.LayoutParams.SOFT_INPUT_STATE_HIDDEN)
+            w.statusBarColor = bg
+            w.navigationBarColor = bg
+            if (Build.VERSION.SDK_INT >= 30) {
+                w.setDecorFitsSystemWindows(false)
+            } else {
+                w.decorView.systemUiVisibility = layoutFlags()
+            }
+        }
+        box.setOnApplyWindowInsetsListener { v, insets ->
+            if (Build.VERSION.SDK_INT >= 30) {
+                val sys = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout())
+                val ime = insets.getInsets(WindowInsets.Type.ime())
+                v.setPadding(sys.left, sys.top, sys.right, max(sys.bottom, ime.bottom))
+            } else {
+                v.setPadding(
+                    insets.systemWindowInsetLeft,
+                    insets.systemWindowInsetTop,
+                    insets.systemWindowInsetRight,
+                    insets.systemWindowInsetBottom
+                )
+            }
+            insets
+        }
+
+        var allItems: List<MediaFile> = emptyList()
+        var scanning = true
+        fun applyFilter() {
+            val q = search.text.toString().trim().lowercase(Locale.US)
+            adapter.items = if (q.isEmpty()) allItems else allItems.filter {
+                it.name.lowercase(Locale.US).contains(q) || it.folder.lowercase(Locale.US).contains(q)
+            }
+            adapter.notifyDataSetChanged()
+            val kindName = if (isVideo) "ভিডিও" else "সাবটাইটেল"
+            info.text = if (scanning) {
+                "⏳ মোবাইলে খুঁজছি… এখন পর্যন্ত " + bn(allItems.size.toString()) + "টি " + kindName + " পাওয়া গেছে"
+            } else if (allItems.isEmpty()) {
+                "কোনো " + kindName + " পাওয়া যায়নি। নিচের বোতাম দিয়ে নিজে খুঁজে দেখুন।"
+            } else if (q.isNotEmpty()) {
+                "🔍 " + bn(adapter.items.size.toString()) + "টি মিলেছে (মোট " + bn(allItems.size.toString()) + "টি)"
+            } else {
+                "✅ মোট " + bn(allItems.size.toString()) + "টি " + kindName + " · নতুনগুলো উপরে"
+            }
+        }
+        fun showItems(items: List<MediaFile>, stillScanning: Boolean) {
+            if (!isVideo) for (f in items) f.match = srtMatchesVideo(f.name)
+            allItems = items.sortedWith(
+                compareByDescending<MediaFile> { it.match }.thenByDescending { it.modified }
+            )
+            scanning = stillScanning
+            applyFilter()
+        }
+
+        search.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {
+            }
+
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
+            }
+
+            override fun afterTextChanged(s: Editable?) {
+                applyFilter()
+            }
+        })
+
+        list.setOnItemClickListener { _, _, position, _ ->
+            val f = adapter.items.getOrNull(position)
+            if (f != null) {
+                dlg.dismiss()
+                onFilePicked(kind, f)
+            }
+        }
+        dlg.setOnDismissListener {
+            if (pickerToken == token) pickerToken++
+        }
+        dlg.show()
+
+        Thread {
+            val found = LinkedHashMap<String, MediaFile>()
+            try {
+                if (isVideo) queryVideoStore(found) else querySrtStore(found)
+            } catch (e: Exception) {
+            }
+            val first = ArrayList(found.values)
+            runOnUiThread { if (pickerToken == token) showItems(first, true) }
+            try {
+                walkStorage(isVideo, found, token)
+            } catch (e: Exception) {
+            }
+            val all = ArrayList(found.values)
+            runOnUiThread { if (pickerToken == token) showItems(all, false) }
+        }.start()
+    }
+
+    private fun onFilePicked(kind: Int, f: MediaFile) {
+        val uri = Uri.fromFile(File(f.path))
+        if (kind == PICK_VIDEO) {
+            prefs.edit().putString("video", uri.toString()).putLong("pos", 0L).apply()
+            loadVideo(uri, 0L)
+            flash("🎬 ভিডিও খোলা হয়েছে")
+        } else {
+            try {
+                if (loadSrt(uri)) {
+                    prefs.edit().putString("srt", uri.toString()).apply()
+                    flash("📄 সাবটাইটেল লোড হয়েছে")
+                }
+            } catch (e: Exception) {
+                flash("SRT ফাইলটি পড়া যায়নি।")
+            }
+        }
+    }
+
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         if (resultCode != RESULT_OK) return
@@ -714,7 +1285,9 @@ class MainActivity : Activity() {
         player.prepare()
         if (startAt > 0L) player.seekTo(startAt)
         player.playWhenReady = false
-        videoName.text = "🎬 " + displayName(uri)
+        val vName = displayName(uri)
+        currentVideoBase = vName.substringBeforeLast('.').lowercase(Locale.US).trim()
+        videoName.text = "🎬 " + vName
         emptyHint.visibility = View.GONE
         resetSpeech(startAt)
     }
@@ -1286,7 +1859,7 @@ class MainActivity : Activity() {
         val idx = if (list.isEmpty()) -1 else findCueAt(list, pos)
         if (idx == lastShownIdx) return
         lastShownIdx = idx
-        if (idx < 0) {
+        if (idx < 0 || !showSubs) {
             subtitleView.visibility = View.GONE
         } else {
             subtitleView.text = list[idx].display
@@ -1299,11 +1872,20 @@ class MainActivity : Activity() {
         if (dur > 0L) {
             val d = min(dur, Int.MAX_VALUE.toLong()).toInt()
             if (seekBar.max != d) seekBar.max = d
+            if (fsSeek.max != d) fsSeek.max = d
             if (!userSeeking) {
-                seekBar.progress = min(pos, dur).toInt()
-                curTime.text = formatTime(pos)
+                val p = min(pos, dur).toInt()
+                val txt = formatTime(pos)
+                seekBar.progress = p
+                curTime.text = txt
+                if (fsBarVisible) {
+                    fsSeek.progress = p
+                    fsCur.text = txt
+                }
             }
-            durTime.text = formatTime(dur)
+            val dt = formatTime(dur)
+            durTime.text = dt
+            fsDur.text = dt
         }
     }
 
@@ -1407,6 +1989,16 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         if (ttsReady) loadVoices()
+        // সেটিংস থেকে অনুমতি দিয়ে ফিরে এলে সাথে সাথে তালিকা খোলা
+        if (pendingPick != 0 && Build.VERSION.SDK_INT >= 30) {
+            val k = pendingPick
+            pendingPick = 0
+            if (hasStorageAccess()) {
+                openPicker(k)
+            } else {
+                flash("অনুমতি দেওয়া হয়নি। চাইলে তালিকার নিচের বোতাম দিয়ে নিজে খুঁজে নিন।")
+            }
+        }
     }
 
     override fun onPause() {
