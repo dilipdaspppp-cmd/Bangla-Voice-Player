@@ -56,6 +56,7 @@ import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.Spinner
 import android.widget.TextView
+import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.PlaybackParameters
@@ -77,9 +78,16 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 
-// একটি সাবটাইটেল লাইন
+// একটি সাবটাইটেল লাইন (স্ক্রিনে দেখানোর জন্য)
 class Cue(val startMs: Long, var endMs: Long, var display: String, var speech: String) {
-    // এই লাইনের কণ্ঠ ভিডিওর কোন সময়ের মধ্যে শেষ হওয়া উচিত (পরের লাইন শুরুর একটু আগে)
+    // লাইনটি ড্যাশ (-) দিয়ে শুরু = নতুন কেউ কথা বলছে
+    var newSpeaker: Boolean = false
+}
+
+// একসাথে পড়া হবে এমন একটি পুরো বাক্য (এক বা একাধিক সাবটাইটেল লাইন মিলে)
+// একটা বাক্য ভেঙে দুই লাইনে থাকলে আলাদা আলাদা পড়লে রোবটের মতো শোনায়, তাই একসাথে পড়া হয়
+class SpeechUnit(val startMs: Long, val firstCue: Int, var lastCue: Int, var text: String, var lastEndMs: Long) {
+    // এই বাক্যের কণ্ঠ ভিডিওর কোন সময়ের মধ্যে শেষ হওয়া উচিত (পরের বাক্য শুরুর একটু আগে)
     var windowEnd: Long = 0L
 }
 
@@ -153,6 +161,10 @@ class MainActivity : Activity() {
         const val WAIT_SPEED = 0.3f      // কণ্ঠ তৈরি না হওয়া পর্যন্ত ভিডিওর গতি
         const val MAX_BOOST = 1.12f      // কণ্ঠ সর্বোচ্চ এতটুকু দ্রুত হবে, যাতে স্বাভাবিক থাকে
         const val TICK_MS = 30L
+        const val MAX_EARLY_MS = 300L    // কণ্ঠ লম্বা হলে সর্বোচ্চ এতটুকু আগে শুরু হবে
+        const val JOIN_GAP_MS = 600L     // দুই লাইনের ফাঁক এর কম হলে একই বাক্য ধরা হবে
+        const val MAX_JOIN_CUES = 3      // এক বাক্যে সর্বোচ্চ কয়টি লাইন
+        const val MAX_JOIN_CHARS = 200   // এক বাক্যে সর্বোচ্চ কত অক্ষর
         val EMPTY_CLIP = Clip(false, ByteArray(0), 0, 0, 0, 0L)
         val NL: String = Char(10).toString()
     }
@@ -161,10 +173,12 @@ class MainActivity : Activity() {
     private lateinit var player: ExoPlayer
     private var tts: TextToSpeech? = null
     @Volatile private var ttsReady = false
+    @Volatile private var ttsFailed = false
     private val handler = Handler(Looper.getMainLooper())
     private val executor: ExecutorService = Executors.newSingleThreadExecutor()
 
     @Volatile private var cues: List<Cue> = emptyList()
+    @Volatile private var units: List<SpeechUnit> = emptyList()
     private val cache = ConcurrentHashMap<Int, Clip>()
     private val inFlight: MutableSet<String> = Collections.synchronizedSet(HashSet<String>())
     private val latches = ConcurrentHashMap<String, CountDownLatch>()
@@ -652,7 +666,16 @@ class MainActivity : Activity() {
     // ================= ভিডিও প্লেয়ার =================
 
     private fun setupPlayer() {
-        player = ExoPlayer.Builder(this).build()
+        // ফোন এলে বা অন্য অ্যাপে গান চালালে ভিডিও নিজে থেমে যাবে,
+        // হেডফোন খুলে ফেললেও থেমে যাবে (হঠাৎ জোরে স্পিকারে বাজবে না)
+        val movieAudio = androidx.media3.common.AudioAttributes.Builder()
+            .setUsage(C.USAGE_MEDIA)
+            .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
+            .build()
+        player = ExoPlayer.Builder(this)
+            .setAudioAttributes(movieAudio, true)
+            .setHandleAudioBecomingNoisy(true)
+            .build()
         player.setVideoSurfaceView(surfaceView)
         player.addListener(object : Player.Listener {
             override fun onIsPlayingChanged(isPlaying: Boolean) {
@@ -744,18 +767,24 @@ class MainActivity : Activity() {
         resetSpeech(t)
     }
 
+    // সোয়াইপ করলে বাক্যের শুরুতে যাবে, যাতে কণ্ঠ পুরো বাক্যটা পড়ে
+    private fun jumpStarts(): List<Long> {
+        val us = units
+        return if (us.isNotEmpty()) us.map { it.startMs } else cues.map { it.startMs }
+    }
+
     private fun nextSubtitle() {
-        val list = cues
+        val starts = jumpStarts()
         val pos = player.currentPosition
-        val idx = list.indexOfFirst { it.startMs > pos + 50L }
-        if (idx >= 0) seekToMs(list[idx].startMs)
+        val idx = starts.indexOfFirst { it > pos + 50L }
+        if (idx >= 0) seekToMs(starts[idx])
     }
 
     private fun prevSubtitle() {
-        val list = cues
+        val starts = jumpStarts()
         val pos = player.currentPosition
-        val idx = list.indexOfLast { it.startMs < pos - 800L }
-        if (idx >= 0) seekToMs(list[idx].startMs) else seekToMs(0L)
+        val idx = starts.indexOfLast { it < pos - 800L }
+        if (idx >= 0) seekToMs(starts[idx]) else seekToMs(0L)
     }
 
     private fun setupGestures() {
@@ -1355,9 +1384,12 @@ class MainActivity : Activity() {
             flash("এই ফাইলে কোনো সাবটাইটেল পাওয়া যায়নি।")
             return false
         }
+        val built = buildUnits(parsed)
+        finishSpeaking()
         prepGen++
         cache.clear()
         cues = parsed
+        units = built
         failCount = 0
         srtName.text = "📄 " + displayName(uri) + " · " + bn(parsed.size.toString()) + "টি লাইন"
         resetSpeech(if (player.mediaItemCount > 0) player.currentPosition else 0L)
@@ -1423,22 +1455,142 @@ class MainActivity : Activity() {
         return sb.toString()
     }
 
+    // HTML চিহ্ন (&amp; ইত্যাদি) সাধারণ লেখায় বদলানো
+    private fun decodeEntities(s: String): String {
+        if (!s.contains('&')) return s
+        return s.replace("&nbsp;", " ")
+            .replace("&quot;", "" + '"')
+            .replace("&#39;", Char(39).toString())
+            .replace("&apos;", Char(39).toString())
+            .replace("&lt;", "")
+            .replace("&gt;", "")
+            .replace("&amp;", "&")
+    }
+
+    // ইমোজি আর বাড়তি চিহ্ন বাদ দেওয়া, নাহলে কণ্ঠ এগুলোর নাম পড়ে ফেলে
+    private fun stripSymbols(s: String): String {
+        val sb = StringBuilder()
+        var i = 0
+        while (i < s.length) {
+            val cp = s.codePointAt(i)
+            i += Character.charCount(cp)
+            if (cp == 0xFE0F) continue
+            val drop = cp in 0x1F000..0x1FAFF || cp in 0x2600..0x27BF || cp in 0x2B00..0x2BFF ||
+                cp == '#'.code || cp == '*'.code || cp == '~'.code || cp == '_'.code ||
+                cp == '|'.code || cp == '^'.code || cp == '='.code
+            if (drop) sb.append(' ') else sb.appendCodePoint(cp)
+        }
+        return sb.toString()
+    }
+
+    // ইংরেজি বড় হাতের বক্তার নাম (যেমন JOHN:) পড়া হবে না
+    private fun removeSpeakerLabel(s: String): String {
+        val colon = s.indexOf(':')
+        if (colon < 2 || colon > 24 || colon >= s.length - 1) return s
+        val label = s.substring(0, colon)
+        if (!label.any { it in 'A'..'Z' }) return s
+        if (!label.all { it in 'A'..'Z' || it == ' ' || it == '.' || it == '-' || it == Char(39) }) return s
+        return s.substring(colon + 1).trim()
+    }
+
+    // ... বা .. বা … কে একটি … চিহ্নে আনা
+    private fun normalizeDots(s: String): String {
+        val sb = StringBuilder()
+        var i = 0
+        while (i < s.length) {
+            val c = s[i]
+            if (c == '…' || (c == '.' && i + 1 < s.length && s[i + 1] == '.')) {
+                while (i < s.length && (s[i] == '.' || s[i] == '…')) i++
+                if (sb.isEmpty() || sb.last() != '…') sb.append('…')
+                continue
+            }
+            sb.append(c)
+            i++
+        }
+        return sb.toString()
+    }
+
+    private val punctChars = setOf('।', '॥', '?', '!', ',', ';', ':', '.', '…')
+    private val endChars = setOf('।', '॥', '?', '!', '.')
+    private val closeChars = setOf('"', Char(39), '”', '’', '»', ')')
+
+    // যতিচিহ্ন গোছানো: !!! কে !, চিহ্নের আগের ফাঁকা বাদ, শুরুতে থাকা চিহ্ন বাদ
+    private fun tidySpeech(s: String): String {
+        val sb = StringBuilder()
+        for (c in collapseSpaces(s)) {
+            if (c in punctChars) {
+                while (sb.isNotEmpty() && sb.last() == ' ') sb.setLength(sb.length - 1)
+                if (sb.isEmpty()) continue
+                val last = sb.last()
+                if (last == c) continue
+                if (c == '।' && last == '.') {
+                    sb.setCharAt(sb.length - 1, '।')
+                    continue
+                }
+                sb.append(c)
+            } else {
+                sb.append(c)
+            }
+        }
+        return sb.toString().trim()
+    }
+
+    // বাক্যটি কি এখানেই শেষ (দাঁড়ি, প্রশ্ন বা আশ্চর্য চিহ্ন আছে)?
+    private fun endsSentence(s: String): Boolean {
+        var t = s.trimEnd()
+        while (t.isNotEmpty() && t.last() in closeChars) t = t.dropLast(1).trimEnd()
+        return t.isNotEmpty() && t.last() in endChars
+    }
+
+    // দুই টুকরো জোড়া: আগেরটা … দিয়ে শেষ হলে (মানুষ একটু থেমে বলছে) মাঝে কমা দিয়ে ছোট বিরতি
+    private fun joinSpeech(a: String, b: String): String {
+        val at = a.trimEnd()
+        val pause = at.endsWith("…")
+        val left = at.trimEnd('…').trimEnd()
+        val right = b.trimStart().trimStart('…').trimStart()
+        return tidySpeech(left + (if (pause) ", " else " ") + right)
+    }
+
+    // পড়ার আগে শেষবার গোছানো: মাঝের … = ছোট বিরতি (কমা)
+    private fun finishSpeech(s: String): String {
+        var t = tidySpeech(s).trim('…', ' ')
+        t = t.replace("…", ",")
+        return tidySpeech(t)
+    }
+
     private fun makeCue(start: Long, end: Long, lines: List<String>): Cue? {
         val shown = ArrayList<String>()
         val spoken = ArrayList<String>()
+        var firstDash = false
         for (raw in lines) {
-            val noTags = removeBetween(removeBetween(raw, '<', '>'), '{', '}').trim()
+            val noTags = decodeEntities(removeBetween(removeBetween(raw, '<', '>'), '{', '}')).trim()
             if (noTags.isNotEmpty()) shown.add(noTags)
-            var s = removeBetween(noTags, '[', ']')
-            s = s.filter { it != '♪' && it != '♫' && it != '#' && it != '*' }
-            s = s.trim().trimStart('-', '–', '—').trim()
-            if (s.isNotEmpty()) spoken.add(s)
+            var s = removeBetween(noTags, '[', ']').trim()
+            // পুরো লাইন বন্ধনীর ভেতরে থাকলে সেটা শব্দের বর্ণনা, যেমন (হাসি) — পড়া হবে না
+            if (s.length >= 2 && s.first() == '(' && s.last() == ')') s = ""
+            val dash = s.isNotEmpty() && (s[0] == '-' || s[0] == '–' || s[0] == '—')
+            s = s.trimStart('-', '–', '—').trim()
+            s = removeSpeakerLabel(s)
+            s = stripSymbols(s.replace("&", " এবং "))
+            s = tidySpeech(normalizeDots(s))
+            if (s.isEmpty()) continue
+            if (spoken.isEmpty()) {
+                firstDash = dash
+            } else if (dash) {
+                // দুইজনের কথোপকথন: আগের জনের কথা শেষে ছোট থামা
+                val prev = spoken[spoken.size - 1]
+                if (!endsSentence(prev)) spoken[spoken.size - 1] = prev.trimEnd('…', ' ', ',') + "।"
+            }
+            spoken.add(s)
         }
         val display = shown.joinToString(NL)
-        val speech = collapseSpaces(spoken.joinToString(" "))
+        var speech = ""
+        for (p in spoken) speech = if (speech.isEmpty()) p else joinSpeech(speech, p)
         if (display.isBlank() && speech.isBlank()) return null
         val e = if (end > start) end else start + 1500L
-        return Cue(start, e, display, speech)
+        val cue = Cue(start, e, display, speech)
+        cue.newSpeaker = firstDash
+        return cue
     }
 
     private fun parseSrt(text: String): List<Cue> {
@@ -1477,22 +1629,60 @@ class MainActivity : Activity() {
             if (last != null && c.startMs < last.startMs + 300L) {
                 last.endMs = max(last.endMs, c.endMs)
                 last.display = (last.display + NL + c.display).trim()
-                last.speech = (last.speech + " " + c.speech).trim()
+                last.speech = if (last.speech.isEmpty()) c.speech else if (c.speech.isEmpty()) last.speech else joinSpeech(last.speech, c.speech)
             } else {
                 merged.add(c)
             }
         }
+        return merged
+    }
 
-        // প্রতিটি লাইনের কণ্ঠ কখনের মধ্যে শেষ হওয়া উচিত তা হিসাব করা
-        for (i in merged.indices) {
-            val c = merged[i]
-            c.windowEnd = if (i + 1 < merged.size) {
-                max(merged[i + 1].startMs - MARGIN_MS, c.startMs + 300L)
+    // সাবটাইটেল লাইনগুলো থেকে পুরো বাক্য তৈরি:
+    // আগের লাইন দাঁড়ি/প্রশ্ন/আশ্চর্য চিহ্ন ছাড়া শেষ হলে আর পরের লাইন সাথে সাথে এলে, দুটো একসাথে পড়া হবে
+    private fun buildUnits(list: List<Cue>): List<SpeechUnit> {
+        val out = ArrayList<SpeechUnit>()
+        var cur: SpeechUnit? = null
+        var count = 0
+        for (i in list.indices) {
+            val c = list[i]
+            if (c.speech.isBlank()) {
+                cur = null
+                continue
+            }
+            val u = cur
+            val canJoin = u != null && count < MAX_JOIN_CUES && !c.newSpeaker && !endsSentence(u.text) &&
+                c.startMs - u.lastEndMs <= JOIN_GAP_MS &&
+                u.text.length + c.speech.length <= MAX_JOIN_CHARS
+            if (u != null && canJoin) {
+                u.text = joinSpeech(u.text, c.speech)
+                u.lastCue = i
+                u.lastEndMs = max(u.lastEndMs, c.endMs)
+                count++
+            } else {
+                val n = SpeechUnit(c.startMs, i, i, c.speech, c.endMs)
+                out.add(n)
+                cur = n
+                count = 1
+            }
+        }
+        for (k in out.indices) {
+            val u = out[k]
+            u.windowEnd = if (k + 1 < out.size) {
+                max(out[k + 1].startMs - MARGIN_MS, u.startMs + 300L)
             } else {
                 Long.MAX_VALUE / 4L
             }
+            u.text = finishSpeech(u.text)
         }
-        return merged
+        return out.filter { it.text.isNotBlank() }.let { kept ->
+            if (kept.size == out.size) out else {
+                for (k in kept.indices) {
+                    val u = kept[k]
+                    u.windowEnd = if (k + 1 < kept.size) max(kept[k + 1].startMs - MARGIN_MS, u.startMs + 300L) else Long.MAX_VALUE / 4L
+                }
+                kept
+            }
+        }
     }
 
     // ================= কণ্ঠ (Google TTS) =================
@@ -1500,6 +1690,7 @@ class MainActivity : Activity() {
     private fun onTtsInit(status: Int) {
         val t = tts
         if (status != TextToSpeech.SUCCESS || t == null) {
+            ttsFailed = true
             showWarn("কণ্ঠ ইঞ্জিন চালু করা যায়নি। Play Store থেকে Speech Services by Google অ্যাপটি ইনস্টল বা আপডেট করুন।")
             return
         }
@@ -1647,7 +1838,7 @@ class MainActivity : Activity() {
     // সামনের কয়েকটি লাইনের কণ্ঠ পেছনে পেছনে তৈরি করে রাখা
     private fun schedulePrep(from: Int) {
         if (!ttsReady) return
-        val list = cues
+        val list = units
         if (list.isEmpty()) return
         wantFrom = from
         val gen = prepGen
@@ -1673,25 +1864,26 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun prepareJob(i: Int, gen: Int, list: List<Cue>) {
+    private fun prepareJob(i: Int, gen: Int, list: List<SpeechUnit>) {
         if (gen != prepGen) return
         val from = wantFrom
         if (i < from - 1 || i > from + AHEAD + 2) return
         if (cache.containsKey(i)) return
-        val cue = list.getOrNull(i) ?: return
-        if (cue.speech.isBlank()) {
+        val unit = list.getOrNull(i) ?: return
+        if (unit.text.isBlank()) {
             if (gen == prepGen) cache[i] = EMPTY_CLIP
             return
         }
         applyVoiceIfNeeded()
-        var clip = synth(cue.speech, baseRate)
+        var clip = synth(unit.text, baseRate)
         if (clip != null && clip.ok) {
             // কণ্ঠ লম্বা হলে প্রথমে কণ্ঠ সামান্য দ্রুত করা হবে (সর্বোচ্চ ১২%), বাকিটা ভিডিও ধীর করে মেলানো হবে
-            val window = cue.windowEnd - cue.startMs
+            // আগে শুরু করার সুযোগটুকুও (৩০০ মিলিসেকেন্ড) হিসাবে ধরা হয়
+            val window = unit.windowEnd - unit.startMs + MAX_EARLY_MS
             if (window in 301L..100000L && clip.durMs > window + 150L) {
                 val factor = min(MAX_BOOST, clip.durMs.toFloat() / window.toFloat())
                 if (factor > 1.03f) {
-                    val faster = synth(cue.speech, baseRate * factor)
+                    val faster = synth(unit.text, baseRate * factor)
                     if (faster != null && faster.ok) clip = faster
                 }
             }
@@ -1770,7 +1962,8 @@ class MainActivity : Activity() {
         val frameBytes = 2 * channels
         val frames = dataLen / frameBytes
         if (frames <= 0) return EMPTY_CLIP
-        val threshold = 500
+        // নরম শুরুর শব্দ (যেমন স, হ) যাতে কেটে না যায়, তাই সীমা কম রাখা হয়েছে
+        val threshold = 300
         var first = -1
         for (i in 0 until frames) {
             if (abs(bb.getShort(dataStart + i * frameBytes).toInt()) > threshold) {
@@ -1786,12 +1979,36 @@ class MainActivity : Activity() {
                 break
             }
         }
-        val s0 = max(0, first - rate * 40 / 1000)
-        val s1 = min(frames, last + 1 + rate * 90 / 1000)
+        val s0 = max(0, first - rate * 60 / 1000)
+        val s1 = min(frames, last + 1 + rate * 120 / 1000)
         val realFrames = s1 - s0
         val realBytes = realFrames * frameBytes
         val out = ByteArray(max(realBytes, 8192))
         System.arraycopy(all, dataStart + s0 * frameBytes, out, 0, realBytes)
+
+        // শুরু আর শেষে খুব ছোট ফেড, যাতে "টক" শব্দ না হয়
+        val ob = ByteBuffer.wrap(out).order(ByteOrder.LITTLE_ENDIAN)
+        val fadeIn = min(realFrames / 4, rate * 8 / 1000)
+        val fadeOut = min(realFrames / 4, rate * 25 / 1000)
+        if (fadeIn > 0) {
+            for (fr in 0 until fadeIn) {
+                val g = fr.toFloat() / fadeIn.toFloat()
+                for (ch in 0 until channels) {
+                    val at = (fr * channels + ch) * 2
+                    ob.putShort(at, (ob.getShort(at) * g).toInt().toShort())
+                }
+            }
+        }
+        if (fadeOut > 0) {
+            for (k in 0 until fadeOut) {
+                val fr = realFrames - 1 - k
+                val g = k.toFloat() / fadeOut.toFloat()
+                for (ch in 0 until channels) {
+                    val at = (fr * channels + ch) * 2
+                    ob.putShort(at, (ob.getShort(at) * g).toInt().toShort())
+                }
+            }
+        }
         return Clip(true, out, rate, channels, realFrames, realFrames * 1000L / rate)
     }
 
@@ -1854,11 +2071,21 @@ class MainActivity : Activity() {
         schedulePrep(nextSpeakIdx)
     }
 
+    // ভিডিওর কোনো জায়গায় লাফ দিলে কোন বাক্য থেকে পড়া শুরু হবে
+    // বাক্যের মাঝখানে পড়লে সেটা বাদ দিয়ে পরেরটা থেকে শুরু, নাহলে পুরো বাক্য পড়তে ভিডিও প্রায় থেমে যেত
+    private fun firstUnitFrom(list: List<SpeechUnit>, pos: Long): Int {
+        for (k in list.indices) {
+            val u = list[k]
+            val span = max(0L, min(u.windowEnd, u.lastEndMs) - u.startMs)
+            val allow = min(700L, max(250L, span * 3L / 10L))
+            if (pos <= u.startMs + allow) return k
+        }
+        return list.size
+    }
+
     private fun resetSpeech(pos: Long) {
         finishSpeaking()
-        val list = cues
-        val idx = list.indexOfFirst { it.endMs > pos }
-        nextSpeakIdx = if (idx < 0) list.size else idx
+        nextSpeakIdx = firstUnitFrom(units, pos)
         waitStart = 0L
         duckHoldUntil = 0L
         lastShownIdx = -2
@@ -1930,13 +2157,15 @@ class MainActivity : Activity() {
             return
         }
         val list = cues
+        val us = units
         val n = bn(list.size.toString())
         var text = when {
             player.mediaItemCount == 0 && list.isEmpty() -> "শুরু করতে ভিডিও আর SRT ফাইল বেছে নিন।"
             list.isEmpty() -> "এখন SRT ফাইল বেছে নিন।"
             player.mediaItemCount == 0 -> "এখন ভিডিও বেছে নিন।"
+            ttsFailed -> "⚠ কণ্ঠ ইঞ্জিন চালু হয়নি, শুধু ভিডিও আর লেখা চলবে।"
             !ttsReady -> "কণ্ঠ ইঞ্জিন চালু হচ্ছে…"
-            nextSpeakIdx >= list.size && speaking == null -> n + "টি সাবটাইটেল · সব লাইন পড়া শেষ"
+            nextSpeakIdx >= us.size && speaking == null -> n + "টি সাবটাইটেল · সব লাইন পড়া শেষ"
             speaking != null || cache.containsKey(nextSpeakIdx) -> "✅ " + n + "টি সাবটাইটেল · কণ্ঠ প্রস্তুত"
             else -> "⏳ " + n + "টি সাবটাইটেল · কণ্ঠ তৈরি হচ্ছে…"
         }
@@ -1944,8 +2173,14 @@ class MainActivity : Activity() {
         statusText.text = text
     }
 
+    // কণ্ঠ বাক্যের সময়ের চেয়ে লম্বা হলে কতটা আগে শুরু করা হবে (সর্বোচ্চ ৩০০ মিলিসেকেন্ড)
+    private fun leadFor(u: SpeechUnit, clip: Clip): Long {
+        val extra = clip.durMs - (u.windowEnd - u.startMs)
+        return if (extra > 0L) min(MAX_EARLY_MS, max(60L, extra)) else 60L
+    }
+
     private fun tick() {
-        if (!::player.isInitialized) return
+        if (!::player.isInitialized || released) return
         val now = SystemClock.uptimeMillis()
         val pos = player.currentPosition
         tickCount++
@@ -1956,7 +2191,8 @@ class MainActivity : Activity() {
             schedulePrep(nextSpeakIdx)
         }
         if (!player.isPlaying) return
-        val list = cues
+        val list = units
+        val voiceOn = ttsReady
 
         // ১. চলতি কণ্ঠ শেষ হয়েছে কিনা দেখা
         val sp0 = speaking
@@ -1968,51 +2204,67 @@ class MainActivity : Activity() {
             }
             if (head >= sp0.frames - 1 || now - sp0.lastMoveAt > 1500L) {
                 finishSpeaking()
-                duckHoldUntil = now + 350L
+                // পরের বাক্য কাছেই থাকলে মাঝখানে ভিডিওর আওয়াজ হঠাৎ বেড়ে আবার কমবে না
+                val nu = list.getOrNull(nextSpeakIdx)
+                val gap = if (nu != null) nu.startMs - pos else Long.MAX_VALUE
+                duckHoldUntil = if (gap in 0L..1200L) {
+                    now + (gap.toFloat() / max(curSpeed, 0.1f)).toLong() + 250L
+                } else {
+                    now + 300L
+                }
             }
         }
 
-        // ২. সময় হলে পরের লাইনের কণ্ঠ শুরু করা
-        if (speaking == null && nextSpeakIdx < list.size) {
-            val cue = list[nextSpeakIdx]
+        // ২. সময় হলে পরের বাক্যের কণ্ঠ শুরু করা
+        var nextLead = 60L
+        if (voiceOn && speaking == null && nextSpeakIdx < list.size) {
+            val u = list[nextSpeakIdx]
             val clip = cache[nextSpeakIdx]
             if (clip != null && !clip.ok) {
                 advance()
             } else if (clip != null) {
-                if (pos >= cue.startMs - 60L) startSpeaking(nextSpeakIdx, clip)
-            } else if (pos >= cue.startMs) {
+                nextLead = leadFor(u, clip)
+                if (pos >= u.startMs - nextLead) startSpeaking(nextSpeakIdx, clip)
+            } else if (pos >= u.startMs) {
                 if (waitStart == 0L) waitStart = now
                 if (now - waitStart > 3000L) advance()
             }
         }
 
-        // ৩. গণিত: বাকি কথা শেষ হতে যত সময় লাগবে, ঠিক তত সময়ে ভিডিও পরের লাইনের কাছে পৌঁছাবে
-        //    ভিডিওর গতি = (পরের লাইন পর্যন্ত বাকি ভিডিও সময়) / (বাকি কথার আসল সময়)
+        // ৩. গণিত: বাকি কথা শেষ হতে যত সময় লাগবে, ঠিক তত সময়ে ভিডিও পরের বাক্যের কাছে পৌঁছাবে
+        //    ভিডিওর গতি = (পরের বাক্য পর্যন্ত বাকি ভিডিও সময়) / (বাকি কথার আসল সময়)
         //    প্রতি ৩০ মিলিসেকেন্ডে নতুন করে মাপা হয়, তাই ভুল জমে না
         var target = 1f
         val sp = speaking
         if (sp != null) {
-            val cue = list.getOrNull(sp.idx)
+            val u = list.getOrNull(sp.idx)
             val remain = max(0, sp.frames - sp.lastHead).toLong() * 1000L / max(1, sp.sampleRate).toLong()
-            if (cue != null && remain > 40L) {
-                val vRemain = cue.windowEnd - pos
+            if (u != null && remain > 40L) {
+                val vRemain = u.windowEnd - pos
                 target = if (vRemain <= 0L) MIN_SPEED else (vRemain.toFloat() / remain.toFloat()).coerceIn(MIN_SPEED, 1f)
             }
-        } else if (nextSpeakIdx < list.size && !cache.containsKey(nextSpeakIdx)) {
+        } else if (voiceOn && nextSpeakIdx < list.size && !cache.containsKey(nextSpeakIdx)) {
             val until = list[nextSpeakIdx].startMs - pos
             target = if (until > 700L) 1f else if (until > 0L) 0.6f else WAIT_SPEED
         }
+        // খুব সামান্য পার্থক্যে গতি বদলানো হবে না, এতে ভিডিও আরও মসৃণ চলে
+        if (target > 0.97f) target = 1f
 
         // ৪. গতি হঠাৎ না বদলে ধীরে ধীরে বদলানো (কমানো দ্রুত, বাড়ানো নরমভাবে)
         curSpeed = if (target < curSpeed) max(target, curSpeed - 0.10f) else min(target, curSpeed + 0.035f)
-        if (abs(curSpeed - appliedSpeed) >= 0.015f || (curSpeed == target && curSpeed != appliedSpeed)) {
+        if (abs(curSpeed - appliedSpeed) >= 0.02f || (curSpeed == target && curSpeed != appliedSpeed)) {
             player.playbackParameters = PlaybackParameters(curSpeed)
             appliedSpeed = curSpeed
         }
 
-        // ৫. কণ্ঠ চলার সময় ভিডিওর আওয়াজ ধীরে ধীরে কমানো, পরে ধীরে ধীরে ফেরানো
-        val volTarget = if (speaking != null || now < duckHoldUntil) duckLevel else 1f
-        curVol = if (volTarget < curVol) max(volTarget, curVol - 0.08f) else min(volTarget, curVol + 0.05f)
+        // ৫. ভিডিওর আসল আওয়াজ: কণ্ঠ শুরুর একটু আগেই ধীরে ধীরে কমবে, কণ্ঠ শেষে ধীরে ধীরে ফিরবে
+        val nu = list.getOrNull(nextSpeakIdx)
+        val preDuck = voiceOn && speaking == null && nu != null && cache[nextSpeakIdx]?.ok == true &&
+            pos >= nu.startMs - nextLead - 250L
+        var volTarget = if (speaking != null || now < duckHoldUntil || preDuck) duckLevel else 1f
+        // ভিডিও খুব ধীর হলে টেনে লম্বা হওয়া আসল আওয়াজ শুনতে খারাপ লাগে, তাই আরও কমানো
+        if (curSpeed < 0.7f) volTarget = min(volTarget, duckLevel * ((curSpeed - 0.25f) / 0.45f).coerceIn(0f, 1f))
+        curVol = if (volTarget < curVol) max(volTarget, curVol - 0.15f) else min(volTarget, curVol + 0.04f)
         if (abs(curVol - appliedVol) > 0.001f) {
             player.volume = curVol
             appliedVol = curVol
