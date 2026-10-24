@@ -170,6 +170,11 @@ class MainActivity : Activity() {
         const val PAUSE_END_MS = 600L    // বাক্য শেষ হলে (। ? !) দুই কণ্ঠের মাঝে বিরতি
         const val PAUSE_SPEAKER_MS = 500L // পরের কথা অন্য কেউ বললে বিরতি
         const val PAUSE_MID_MS = 400L    // বাক্য মাঝপথে ভাঙলে বিরতি
+        const val DUCK_DEFAULT = 0.01f   // বাংলা পড়ার সময় ভিডিওর আসল আওয়াজ ১% (প্রায় শোনা যায় না)
+        const val HOLD_GAP_MS = 2000L    // দুই বাংলা কথার মাঝে এর চেয়ে কম ফাঁক হলে আসল আওয়াজ ফিরবে না
+        const val PRE_DUCK_MS = 500L     // বাংলা শুরুর এতটা আগে থেকে আসল আওয়াজ কমতে শুরু করবে
+        const val FADE_OUT_MS = 450f     // আসল আওয়াজ নরমভাবে কমতে কত সময় লাগবে
+        const val FADE_IN_MS = 1600f     // আসল আওয়াজ খুব ধীরে ধীরে ফিরে আসতে কত সময় লাগবে
         const val JOIN_GAP_MS = 600L     // দুই লাইনের ফাঁক এর কম হলে একই বাক্য ধরা হবে
         const val MAX_JOIN_CUES = 3      // এক বাক্যে সর্বোচ্চ কয়টি লাইন
         const val MAX_JOIN_CHARS = 200   // এক বাক্যে সর্বোচ্চ কত অক্ষর
@@ -203,14 +208,19 @@ class MainActivity : Activity() {
     private var waitStart = 0L
     private var lastVoiceEndAt = 0L      // শেষ কণ্ঠটা কখন থেমেছে (ফোনের ঘড়িতে)
     private var pauseNeeded = 0L         // পরের কণ্ঠ শুরুর আগে কতক্ষণ থামতে হবে
-    private var duckUntilPos = -1L       // ভিডিওর এই সময় পর্যন্ত আসল আওয়াজ কম থাকবে
+    private var holdDuckUntil = 0L       // ছোট ফাঁকে এই সময় পর্যন্ত আসল আওয়াজ কম থাকবে
+    private var fadePos = 1f             // আসল আওয়াজের অবস্থা: ০ = পুরো কমানো, ১ = পুরো আওয়াজ
+    private var muteFade = 1f            // আসল আওয়াজ বন্ধ/চালু করার নরম বদল
+    private var muteOriginal = false     // ভিডিওর আসল আওয়াজ পুরো বন্ধ (শুধু বাংলা কণ্ঠ)
+    private var isLocked = false         // স্ক্রিন লক চালু কিনা
+    private var lockDownInside = false
     private var debtMs = 0f              // ভিডিও ধীর হওয়ায় কতটা সময় বেশি লেগেছে (পরে পুষিয়ে নেওয়া হবে)
     private var lastTickAt = 0L
     private var curSpeed = 1f
     private var appliedSpeed = 1f
     private var curVol = 1f
     private var appliedVol = 1f
-    private var duckLevel = 0.1f
+    private var duckLevel = DUCK_DEFAULT
     private var tickCount = 0
     private var lastShownIdx = -2
     private var userSeeking = false
@@ -263,9 +273,17 @@ class MainActivity : Activity() {
     private lateinit var fsPlay: Button
     private lateinit var fsFwd: Button
     private lateinit var fsSubs: Button
+    private lateinit var fsMute: Button
+    private lateinit var lockBtn: TextView
+    private lateinit var muteSwitch: Switch
 
     private val hideBarRunnable = Runnable {
         if (isFullscreen && ::player.isInitialized && player.isPlaying && !userSeeking) setFsBar(false)
+    }
+
+    // লক অবস্থায় দেখানো 🔒 চিহ্ন কিছুক্ষণ পর নিজে লুকিয়ে যাবে
+    private val hideLockRunnable = Runnable {
+        if (isLocked) lockBtn.visibility = View.GONE
     }
 
     private val tickRunnable = object : Runnable {
@@ -288,12 +306,16 @@ class MainActivity : Activity() {
         bindViews()
         setupWindow()
         styleUi()
-        duckLevel = prefs.getFloat("duck", 0.1f).coerceIn(0f, 0.5f)
+        duckLevel = prefs.getFloat("duckLevel", DUCK_DEFAULT).coerceIn(0f, 0.5f)
         duckSeek.progress = (duckLevel * 100f).roundToInt()
         updateSliderLabels()
         showSubs = prefs.getBoolean("showSubs", true)
         subsSwitch.isChecked = showSubs
         fsSubs.alpha = if (showSubs) 1f else 0.45f
+        muteOriginal = prefs.getBoolean("muteOriginal", false)
+        muteFade = if (muteOriginal) 0f else 1f
+        muteSwitch.isChecked = muteOriginal
+        fsMute.text = if (muteOriginal) "🔇" else "🔊"
         setupPlayer()
         setupControls()
         setupGestures()
@@ -302,8 +324,8 @@ class MainActivity : Activity() {
             runOnUiThread { onTtsInit(status) }
         }, "com.google.android.tts")
         // প্রতিবার অ্যাপ খুললে নতুন করে শুরু: আগের ভিডিও/সাবটাইটেল মনে রাখা হবে না
-        // কণ্ঠের গতি এখন অ্যাপ নিজেই ঠিক করে, তাই আগে হাতে বাছা গতিও মুছে ফেলা হয়
-        prefs.edit().remove("video").remove("srt").remove("pos").remove("rate").apply()
+        // কণ্ঠের গতি এখন অ্যাপ নিজেই ঠিক করে, তাই আগে হাতে বাছা গতি আর পুরনো ১০% আওয়াজের সেটিংও মুছে ফেলা হয়
+        prefs.edit().remove("video").remove("srt").remove("pos").remove("rate").remove("duck").apply()
     }
 
     private fun bindViews() {
@@ -345,6 +367,9 @@ class MainActivity : Activity() {
         fsPlay = findViewById<Button>(R.id.fsPlay)!!
         fsFwd = findViewById<Button>(R.id.fsFwd)!!
         fsSubs = findViewById<Button>(R.id.fsSubs)!!
+        fsMute = findViewById<Button>(R.id.fsMute)!!
+        lockBtn = findViewById<TextView>(R.id.lockBtn)!!
+        muteSwitch = findViewById<Switch>(R.id.muteSwitch)!!
     }
 
     // ================= ডিজাইন =================
@@ -385,6 +410,7 @@ class MainActivity : Activity() {
         voiceBox.background = rounded(surface2, 12f)
         subtitleView.background = rounded(0xB3000000.toInt(), 10f)
         exitFull.background = rounded(0x80000000.toInt(), 22f)
+        lockBtn.background = rounded(0x80000000.toInt(), 22f)
         voiceSpinner.backgroundTintList = ColorStateList.valueOf(Color.WHITE)
 
         // ফুলস্ক্রিনের নিচের কন্ট্রোল বার
@@ -398,11 +424,14 @@ class MainActivity : Activity() {
         styleButton(fsPlay, primary)
         styleButton(fsFwd, glass)
         styleButton(fsSubs, glass)
+        styleButton(fsMute, glass)
 
         // সাবটাইটেল সুইচের রঙ
         val states = arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf())
         subsSwitch.thumbTintList = ColorStateList(states, intArrayOf(getColor(R.color.accent), 0xFFCBD5E1.toInt()))
         subsSwitch.trackTintList = ColorStateList(states, intArrayOf(0x992DD4BF.toInt(), 0x6694A3B8))
+        muteSwitch.thumbTintList = subsSwitch.thumbTintList
+        muteSwitch.trackTintList = subsSwitch.trackTintList
     }
 
     private fun bn(s: String): String {
@@ -580,6 +609,7 @@ class MainActivity : Activity() {
             exitFull.visibility = View.GONE
             subtitleView.animate().translationY(0f).setDuration(150L).start()
         }
+        refreshLockBtn()
     }
 
     // কন্ট্রোল ব্যবহার করলে লুকানোর সময় আবার নতুন করে গোনা
@@ -588,6 +618,80 @@ class MainActivity : Activity() {
             handler.removeCallbacks(hideBarRunnable)
             handler.postDelayed(hideBarRunnable, 3500L)
         }
+    }
+
+    // ================= স্ক্রিন লক =================
+
+    // 🔓 চিহ্ন কখন দেখা যাবে: সাধারণ স্ক্রিনে সবসময়, ফুলস্ক্রিনে কন্ট্রোল বারের সাথে
+    private fun refreshLockBtn() {
+        if (isLocked) return
+        handler.removeCallbacks(hideLockRunnable)
+        val hasVideo = ::player.isInitialized && player.mediaItemCount > 0
+        lockBtn.text = "🔓"
+        lockBtn.visibility = if (hasVideo && (!isFullscreen || fsBarVisible)) View.VISIBLE else View.GONE
+    }
+
+    // লক অবস্থায় স্ক্রিনে ছুঁলে শুধু 🔒 চিহ্নটা আড়াই সেকেন্ডের জন্য দেখা যাবে, আর কিছু না
+    private fun showLockHint() {
+        lockBtn.text = "🔒"
+        lockBtn.visibility = View.VISIBLE
+        handler.removeCallbacks(hideLockRunnable)
+        handler.postDelayed(hideLockRunnable, 2500L)
+    }
+
+    private fun setLocked(v: Boolean) {
+        isLocked = v
+        lockDownInside = false
+        handler.removeCallbacks(hideLockRunnable)
+        if (v) {
+            setFsBar(false)
+            showLockHint()
+        } else {
+            refreshLockBtn()
+            if (isFullscreen) setFsBar(true)
+        }
+    }
+
+    private fun touchOnView(v: View, ev: MotionEvent): Boolean {
+        val loc = IntArray(2)
+        v.getLocationOnScreen(loc)
+        val slop = dp(14f)
+        return ev.rawX >= loc[0] - slop && ev.rawX <= loc[0] + v.width + slop &&
+            ev.rawY >= loc[1] - slop && ev.rawY <= loc[1] + v.height + slop
+    }
+
+    // লক চালু থাকলে স্ক্রিনের কোনো ছোঁয়া ভিডিও বা বোতাম পর্যন্ত যাবে না
+    // শুধু 🔒 চিহ্নটা দেখা গেলে সেটায় ট্যাপ করলে লক খুলবে
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (!isLocked) return super.dispatchTouchEvent(ev)
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                lockDownInside = lockBtn.visibility == View.VISIBLE && touchOnView(lockBtn, ev)
+            }
+            MotionEvent.ACTION_UP -> {
+                if (lockDownInside && lockBtn.visibility == View.VISIBLE && touchOnView(lockBtn, ev)) {
+                    setLocked(false)
+                } else {
+                    showLockHint()
+                }
+                lockDownInside = false
+            }
+            MotionEvent.ACTION_CANCEL -> lockDownInside = false
+        }
+        return true
+    }
+
+    // ================= ভিডিওর আসল আওয়াজ বন্ধ/চালু =================
+
+    private fun setMuteOriginal(v: Boolean) {
+        if (muteOriginal != v) {
+            muteOriginal = v
+            prefs.edit().putBoolean("muteOriginal", v).apply()
+            flash(if (v) "🔇 ভিডিওর আসল আওয়াজ বন্ধ, শুধু বাংলা কণ্ঠ শোনা যাবে" else "🔊 ভিডিওর আসল আওয়াজ আবার চালু")
+        }
+        if (muteSwitch.isChecked != v) muteSwitch.isChecked = v
+        fsMute.text = if (v) "🔇" else "🔊"
+        if (::player.isInitialized && !player.isPlaying) applyVolumeNow()
     }
 
     // স্ক্রিনে সাবটাইটেলের লেখা দেখানো চালু/বন্ধ (কণ্ঠ সবসময় চলবে)
@@ -609,6 +713,11 @@ class MainActivity : Activity() {
     }
 
     override fun onBackPressed() {
+        // লক অবস্থায় Back কাজ করবে না, শুধু 🔒 চিহ্ন দেখাবে
+        if (isLocked) {
+            showLockHint()
+            return
+        }
         if (isFullscreen) {
             toggleFullscreen()
             return
@@ -836,6 +945,12 @@ class MainActivity : Activity() {
         btnInstall.setOnClickListener { openVoiceInstall() }
 
         subsSwitch.setOnCheckedChangeListener { _, checked -> setShowSubs(checked) }
+        muteSwitch.setOnCheckedChangeListener { _, checked -> setMuteOriginal(checked) }
+        fsMute.setOnClickListener {
+            setMuteOriginal(!muteOriginal)
+            bumpFsBar()
+        }
+        lockBtn.setOnClickListener { setLocked(true) }
         fsSubs.setOnClickListener {
             setShowSubs(!showSubs)
             bumpFsBar()
@@ -884,7 +999,7 @@ class MainActivity : Activity() {
                 updateSliderLabels()
             },
             { },
-            { _ -> prefs.edit().putFloat("duck", duckLevel).apply() }
+            { _ -> prefs.edit().putFloat("duckLevel", duckLevel).apply() }
         ))
 
         voiceSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
@@ -1367,6 +1482,7 @@ class MainActivity : Activity() {
         videoName.text = "🎬 " + vName
         emptyHint.visibility = View.GONE
         resetSpeech(startAt)
+        refreshLockBtn()
     }
 
     private fun loadSrt(uri: Uri): Boolean {
@@ -2038,9 +2154,6 @@ class MainActivity : Activity() {
         cache.remove(idx)
         nextSpeakIdx = idx + 1
         waitStart = 0L
-        // যতক্ষণ এই বাক্যের সাবটাইটেল স্ক্রিনে থাকবে, ততক্ষণ আসল আওয়াজ কম থাকবে
-        val u = units.getOrNull(idx)
-        if (u != null && u.lastEndMs > duckUntilPos) duckUntilPos = u.lastEndMs
         if (track != null) {
             speaking = Speaking(idx, track, clip.frames, clip.sampleRate, 0, SystemClock.uptimeMillis())
         } else {
@@ -2087,7 +2200,7 @@ class MainActivity : Activity() {
         waitStart = 0L
         lastVoiceEndAt = 0L
         pauseNeeded = 0L
-        duckUntilPos = -1L
+        holdDuckUntil = 0L
         debtMs = 0f
         lastShownIdx = -2
         if (::player.isInitialized) setSpeedNow(1f)
@@ -2174,6 +2287,15 @@ class MainActivity : Activity() {
         statusText.text = text
     }
 
+    // এখন থেকে পরের বাংলা কথা শুরু হতে আনুমানিক কত সময় বাকি (আসল সময়, মিলিসেকেন্ড)
+    private fun timeToNextVoice(nx: SpeechUnit?, pos: Long, now: Long): Long {
+        if (nx == null) return Long.MAX_VALUE / 4L
+        val vLeft = nx.startMs - LEAD_MS - pos
+        val byVideo = if (vLeft <= 0L) 0L else (vLeft.toFloat() / max(curSpeed, 0.5f)).toLong()
+        val pauseLeft = max(0L, lastVoiceEndAt + pauseNeeded - now)
+        return max(byVideo, pauseLeft)
+    }
+
     private fun tick() {
         if (!::player.isInitialized || released) return
         val now = SystemClock.uptimeMillis()
@@ -2211,11 +2333,13 @@ class MainActivity : Activity() {
                 val nu = list.getOrNull(nextSpeakIdx)
                 if (nu != null && pos - nu.startMs > 2500L) p = min(p, 200L)
                 pauseNeeded = p
+                // পরের বাংলা কথা ২ সেকেন্ডের মধ্যেই এলে মাঝখানে আসল আওয়াজ ফিরবে না
+                val gap = timeToNextVoice(nu, pos, now)
+                holdDuckUntil = if (gap <= HOLD_GAP_MS) now + gap + 300L else 0L
             }
         }
 
         // ২. বিরতি শেষ হলে আর ভিডিও পরের বাক্যের সময়ে পৌঁছালে, পরের বাক্যের কণ্ঠ শুরু
-        //    (আগে বিরতির হিসাব ছিল না, তাই একটা কণ্ঠ শেষ হওয়ামাত্র পরেরটা শুরু হয়ে যেত)
         if (voiceOn && speaking == null && nextSpeakIdx < list.size) {
             val u = list[nextSpeakIdx]
             val clip = cache[nextSpeakIdx]
@@ -2273,30 +2397,56 @@ class MainActivity : Activity() {
         // খুব সামান্য পার্থক্যে গতি বদলানো হবে না, এতে ভিডিও আরও মসৃণ চলে
         if (target > 0.97f && target < 1.03f) target = 1f
 
-        // ৪. গতি হঠাৎ না বদলে ধীরে ধীরে বদলানো (কমানো একটু দ্রুত, বাড়ানো নরমভাবে)
-        curSpeed = if (target < curSpeed) max(target, curSpeed - 0.08f) else min(target, curSpeed + 0.025f)
+        // ৪. গতি হঠাৎ না বদলে ধীরে ধীরে বদলানো (দ্রুত থেকে স্বাভাবিকে ফেরাটা খুব নরমভাবে)
+        curSpeed = if (target < curSpeed) {
+            max(target, curSpeed - (if (curSpeed > 1.001f) 0.015f else 0.08f))
+        } else {
+            min(target, curSpeed + 0.02f)
+        }
         if (abs(curSpeed - appliedSpeed) >= 0.02f || (curSpeed == target && curSpeed != appliedSpeed)) {
             player.playbackParameters = PlaybackParameters(curSpeed)
             appliedSpeed = curSpeed
         }
 
-        // ৫. ভিডিওর আসল আওয়াজ: কণ্ঠ চলার সময়, সেই লাইন স্ক্রিনে থাকা পর্যন্ত,
-        //    আর দুই কণ্ঠের মাঝের ছোট বিরতিতে কম থাকবে, যাতে আসল কথা হঠাৎ জোরে ফিরে না আসে
+        // ৫. ভিডিওর আসল আওয়াজ
+        updateVolume(list, voiceOn, pos, now, dt)
+    }
+
+    // ভিডিওর আসল আওয়াজ:
+    // বাংলা পড়ার সময় প্রায় বন্ধ (১%), শুধু বাংলা কণ্ঠ শোনা যায়
+    // বাংলা শুরুর একটু আগে নরমভাবে কমে, পড়া শেষ হলে খুব ধীরে ধীরে ফিরে আসে
+    // দুই বাংলা কথার মাঝে ২ সেকেন্ডের কম ফাঁক হলে মাঝখানে আসল আওয়াজ ফেরে না
+    private fun updateVolume(list: List<SpeechUnit>, voiceOn: Boolean, pos: Long, now: Long, dt: Long) {
         val nx = list.getOrNull(nextSpeakIdx)
-        val gapToNext = if (nx != null) nx.startMs - pos else Long.MAX_VALUE
-        val sinceEnd = if (lastVoiceEndAt > 0L) now - lastVoiceEndAt else Long.MAX_VALUE
-        val approaching = voiceOn && speaking == null && nx != null && cache[nextSpeakIdx]?.ok == true &&
-            gapToNext <= LEAD_MS + 300L
-        val between = voiceOn && speaking == null && (sinceEnd < 250L || (sinceEnd < 4000L && gapToNext <= 1500L))
-        var volTarget = if (speaking != null || pos < duckUntilPos || approaching || between) duckLevel else 1f
-        // ভিডিও ধীর চললে টেনে লম্বা হওয়া আসল আওয়াজ শুনতে খারাপ লাগে, তাই কম রাখা
-        if (curSpeed < 0.9f) volTarget = min(volTarget, duckLevel)
-        if (curSpeed < 0.7f) volTarget = min(volTarget, duckLevel * ((curSpeed - 0.5f) / 0.2f).coerceIn(0f, 1f))
-        curVol = if (volTarget < curVol) max(volTarget, curVol - 0.15f) else min(volTarget, curVol + 0.04f)
-        if (abs(curVol - appliedVol) > 0.001f) {
+        val nextUsable = nx != null && cache[nextSpeakIdx]?.ok != false
+        val soon = voiceOn && speaking == null && nextUsable && timeToNextVoice(nx, pos, now) <= PRE_DUCK_MS
+        val low = voiceOn && (speaking != null || now < holdDuckUntil || soon)
+        val step = dt.toFloat()
+        fadePos = if (low) {
+            max(0f, fadePos - step / (if (speaking != null) 200f else FADE_OUT_MS))
+        } else {
+            min(1f, fadePos + step / FADE_IN_MS)
+        }
+        // আসল আওয়াজ বন্ধ/চালু করলে সেটাও নরমভাবে হবে
+        val muteTarget = if (muteOriginal) 0f else 1f
+        muteFade = if (muteFade < muteTarget) min(muteTarget, muteFade + step / 300f) else max(muteTarget, muteFade - step / 300f)
+        // fadePos এর বর্গ নেওয়া হয়, এতে কানে আওয়াজ সমান তালে বাড়ে-কমে (ঝট করে লাফায় না)
+        setGain(muteFade * (duckLevel + (1f - duckLevel) * fadePos * fadePos))
+    }
+
+    private fun setGain(g: Float) {
+        curVol = g.coerceIn(0f, 1f)
+        if (abs(curVol - appliedVol) > 0.001f || (curVol == 0f && appliedVol != 0f)) {
             player.volume = curVol
             appliedVol = curVol
         }
+    }
+
+    // ভিডিও থামানো অবস্থায় আওয়াজ বন্ধ/চালু করলে সাথে সাথে লাগানো
+    private fun applyVolumeNow() {
+        if (!::player.isInitialized) return
+        muteFade = if (muteOriginal) 0f else 1f
+        setGain(muteFade * (duckLevel + (1f - duckLevel) * fadePos * fadePos))
     }
 
     // ================= জীবনচক্র =================
