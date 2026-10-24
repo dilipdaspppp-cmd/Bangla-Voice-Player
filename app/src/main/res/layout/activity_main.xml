@@ -176,8 +176,16 @@
                     android:id="@+id/fsSubs"
                     android:layout_width="0dp"
                     android:layout_height="44dp"
+                    android:layout_marginRight="8dp"
                     android:layout_weight="1"
                     android:text="💬" />
+
+                <Button
+                    android:id="@+id/fsMute"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_weight="1"
+                    android:text="🔊" />
             </LinearLayout>
         </LinearLayout>
 
@@ -189,6 +197,18 @@
             android:layout_margin="12dp"
             android:gravity="center"
             android:text="✕"
+            android:textColor="@color/white"
+            android:textSize="18sp"
+            android:visibility="gone" />
+
+        <TextView
+            android:id="@+id/lockBtn"
+            android:layout_width="44dp"
+            android:layout_height="44dp"
+            android:layout_gravity="top|start"
+            android:layout_margin="12dp"
+            android:gravity="center"
+            android:text="🔓"
             android:textColor="@color/white"
             android:textSize="18sp"
             android:visibility="gone" />
@@ -368,6 +388,15 @@
                     android:textColor="@color/text"
                     android:textSize="14sp" />
 
+                <Switch
+                    android:id="@+id/muteSwitch"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:minHeight="48dp"
+                    android:text="🔇 ভিডিওর আসল আওয়াজ বন্ধ রাখুন (শুধু বাংলা কণ্ঠ শুনুন)"
+                    android:textColor="@color/text"
+                    android:textSize="14sp" />
+
                 <FrameLayout
                     android:id="@+id/voiceBox"
                     android:layout_width="match_parent"
@@ -448,7 +477,7 @@
                 android:layout_height="wrap_content"
                 android:layout_marginTop="10dp"
                 android:gravity="center"
-                android:text="ভিডিওতে এক ট্যাপ = চালান/থামান (ফুলস্ক্রিনে কন্ট্রোল দেখান/লুকান) · দুই ট্যাপ = ফুলস্ক্রিন · ডানে সোয়াইপ = পরের লাইন · বামে সোয়াইপ = আগের লাইন"
+                android:text="ভিডিওতে এক ট্যাপ = চালান/থামান (ফুলস্ক্রিনে কন্ট্রোল দেখান/লুকান) · দুই ট্যাপ = ফুলস্ক্রিন · ডানে সোয়াইপ = পরের লাইন · বামে সোয়াইপ = আগের লাইন · 🔓 = স্ক্রিন লক (খুলতে স্ক্রিনে ট্যাপ করে 🔒 চাপুন)"
                 android:textColor="@color/textDim"
                 android:textSize="12sp" />
         </LinearLayout>
