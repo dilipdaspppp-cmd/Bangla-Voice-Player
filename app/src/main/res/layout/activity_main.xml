@@ -384,28 +384,18 @@
                 </FrameLayout>
 
                 <TextView
-                    android:id="@+id/speedLabel"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="14dp"
-                    android:textColor="@color/text"
-                    android:textSize="14sp" />
-
-                <SeekBar
-                    android:id="@+id/speedSeek"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:layout_marginTop="4dp"
-                    android:max="80"
-                    android:progressBackgroundTint="@color/textDim"
-                    android:progressTint="@color/accent"
-                    android:thumbTint="@color/accent" />
+                    android:layout_marginTop="12dp"
+                    android:text="⚖ কণ্ঠের গতি আর ভিডিওর গতি অ্যাপ নিজেই মিলিয়ে নেয়। প্রতিটি বাক্যের পর হালকা বিরতি থাকে।"
+                    android:textColor="@color/textDim"
+                    android:textSize="13sp" />
 
                 <TextView
                     android:id="@+id/duckLabel"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:layout_marginTop="12dp"
+                    android:layout_marginTop="14dp"
                     android:textColor="@color/text"
                     android:textSize="14sp" />
 
