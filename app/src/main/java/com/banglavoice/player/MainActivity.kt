@@ -77,6 +77,7 @@ import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
+import kotlin.math.sqrt
 
 // একটি সাবটাইটেল লাইন (স্ক্রিনে দেখানোর জন্য)
 class Cue(val startMs: Long, var endMs: Long, var display: String, var speech: String) {
@@ -87,8 +88,10 @@ class Cue(val startMs: Long, var endMs: Long, var display: String, var speech: S
 // একসাথে পড়া হবে এমন একটি পুরো বাক্য (এক বা একাধিক সাবটাইটেল লাইন মিলে)
 // একটা বাক্য ভেঙে দুই লাইনে থাকলে আলাদা আলাদা পড়লে রোবটের মতো শোনায়, তাই একসাথে পড়া হয়
 class SpeechUnit(val startMs: Long, val firstCue: Int, var lastCue: Int, var text: String, var lastEndMs: Long) {
-    // এই বাক্যের কণ্ঠ ভিডিওর কোন সময়ের মধ্যে শেষ হওয়া উচিত (পরের বাক্য শুরুর একটু আগে)
-    var windowEnd: Long = 0L
+    // পরের বাক্য ভিডিওর কোন সময়ে শুরু হবে (এর মধ্যেই এই বাক্যের কথা আর বিরতি আঁটাতে হবে)
+    var nextStartMs: Long = Long.MAX_VALUE / 4L
+    // এই বাক্য পড়া শেষে কতক্ষণ থামা হবে (মিলিসেকেন্ড)
+    var pauseMs: Long = 0L
 }
 
 // আগে থেকে তৈরি করে রাখা একটি লাইনের কণ্ঠ (অডিও)
@@ -155,13 +158,18 @@ class MainActivity : Activity() {
             "mp4", "mkv", "webm", "3gp", "3g2", "mov", "m4v", "avi", "ts", "m2ts",
             "mts", "flv", "wmv", "mpg", "mpeg", "vob", "ogv"
         )
-        const val AHEAD = 6              // সামনের কয়টি লাইনের কণ্ঠ আগাম তৈরি থাকবে
-        const val MARGIN_MS = 120L       // দুই লাইনের কণ্ঠের মাঝে ন্যূনতম বিরতি
-        const val MIN_SPEED = 0.1f       // ভিডিও সর্বনিম্ন এই গতিতে চলবে, কখনো থামবে না
-        const val WAIT_SPEED = 0.3f      // কণ্ঠ তৈরি না হওয়া পর্যন্ত ভিডিওর গতি
-        const val MAX_BOOST = 1.12f      // কণ্ঠ সর্বোচ্চ এতটুকু দ্রুত হবে, যাতে স্বাভাবিক থাকে
+        const val AHEAD = 6              // সামনের কয়টি বাক্যের কণ্ঠ আগাম তৈরি থাকবে
         const val TICK_MS = 30L
-        const val MAX_EARLY_MS = 300L    // কণ্ঠ লম্বা হলে সর্বোচ্চ এতটুকু আগে শুরু হবে
+        const val BASE_RATE = 1.0f       // কণ্ঠের স্বাভাবিক গতি (দরকার হলে অ্যাপ নিজেই বাড়ায়)
+        const val VOICE_MAX = 1.25f      // লম্বা বাক্যে কণ্ঠ সর্বোচ্চ এতটা দ্রুত হবে, যাতে স্বাভাবিক শোনায়
+        const val SPEED_FLOOR = 0.7f     // ভিডিও সাধারণত এর চেয়ে ধীর হবে না
+        const val SPEED_FLOOR_LATE = 0.55f // কণ্ঠ অনেক পিছিয়ে পড়লে অল্প সময়ের জন্য সর্বনিম্ন এই গতি (তবুও থামবে না)
+        const val SPEED_UP_MAX = 1.12f   // আগে ধীর হওয়ার সময়টুকু পুষিয়ে নিতে ভিডিও সর্বোচ্চ এতটা দ্রুত হবে
+        const val MAX_DEBT_MS = 12000f   // সর্বোচ্চ কতটা সময় পুষিয়ে নেওয়ার জন্য মনে রাখা হবে
+        const val LEAD_MS = 80L          // স্পিকার চালু হতে সামান্য সময় লাগে, তাই কণ্ঠ এতটুকু আগে চালু হয়
+        const val PAUSE_END_MS = 600L    // বাক্য শেষ হলে (। ? !) দুই কণ্ঠের মাঝে বিরতি
+        const val PAUSE_SPEAKER_MS = 500L // পরের কথা অন্য কেউ বললে বিরতি
+        const val PAUSE_MID_MS = 400L    // বাক্য মাঝপথে ভাঙলে বিরতি
         const val JOIN_GAP_MS = 600L     // দুই লাইনের ফাঁক এর কম হলে একই বাক্য ধরা হবে
         const val MAX_JOIN_CUES = 3      // এক বাক্যে সর্বোচ্চ কয়টি লাইন
         const val MAX_JOIN_CHARS = 200   // এক বাক্যে সর্বোচ্চ কত অক্ষর
@@ -185,7 +193,6 @@ class MainActivity : Activity() {
     private val outcomes = ConcurrentHashMap<String, Boolean>()
     @Volatile private var prepGen = 0
     @Volatile private var wantFrom = 0
-    @Volatile private var baseRate = 1.0f
     @Volatile private var wantedVoice: Voice? = null
     @Volatile private var failCount = 0
     private var appliedVoiceKey: String? = null
@@ -194,12 +201,16 @@ class MainActivity : Activity() {
     private var speaking: Speaking? = null
     private var nextSpeakIdx = 0
     private var waitStart = 0L
+    private var lastVoiceEndAt = 0L      // শেষ কণ্ঠটা কখন থেমেছে (ফোনের ঘড়িতে)
+    private var pauseNeeded = 0L         // পরের কণ্ঠ শুরুর আগে কতক্ষণ থামতে হবে
+    private var duckUntilPos = -1L       // ভিডিওর এই সময় পর্যন্ত আসল আওয়াজ কম থাকবে
+    private var debtMs = 0f              // ভিডিও ধীর হওয়ায় কতটা সময় বেশি লেগেছে (পরে পুষিয়ে নেওয়া হবে)
+    private var lastTickAt = 0L
     private var curSpeed = 1f
     private var appliedSpeed = 1f
     private var curVol = 1f
     private var appliedVol = 1f
     private var duckLevel = 0.1f
-    private var duckHoldUntil = 0L
     private var tickCount = 0
     private var lastShownIdx = -2
     private var userSeeking = false
@@ -237,8 +248,6 @@ class MainActivity : Activity() {
     private lateinit var cardVoice: LinearLayout
     private lateinit var voiceBox: FrameLayout
     private lateinit var voiceSpinner: Spinner
-    private lateinit var speedLabel: TextView
-    private lateinit var speedSeek: SeekBar
     private lateinit var duckLabel: TextView
     private lateinit var duckSeek: SeekBar
     private lateinit var warnBox: LinearLayout
@@ -279,9 +288,7 @@ class MainActivity : Activity() {
         bindViews()
         setupWindow()
         styleUi()
-        baseRate = prefs.getFloat("rate", 1.0f).coerceIn(0.7f, 1.5f)
         duckLevel = prefs.getFloat("duck", 0.1f).coerceIn(0f, 0.5f)
-        speedSeek.progress = ((baseRate - 0.7f) * 100f).roundToInt()
         duckSeek.progress = (duckLevel * 100f).roundToInt()
         updateSliderLabels()
         showSubs = prefs.getBoolean("showSubs", true)
@@ -295,7 +302,8 @@ class MainActivity : Activity() {
             runOnUiThread { onTtsInit(status) }
         }, "com.google.android.tts")
         // প্রতিবার অ্যাপ খুললে নতুন করে শুরু: আগের ভিডিও/সাবটাইটেল মনে রাখা হবে না
-        prefs.edit().remove("video").remove("srt").remove("pos").apply()
+        // কণ্ঠের গতি এখন অ্যাপ নিজেই ঠিক করে, তাই আগে হাতে বাছা গতিও মুছে ফেলা হয়
+        prefs.edit().remove("video").remove("srt").remove("pos").remove("rate").apply()
     }
 
     private fun bindViews() {
@@ -322,8 +330,6 @@ class MainActivity : Activity() {
         cardVoice = findViewById<LinearLayout>(R.id.cardVoice)!!
         voiceBox = findViewById<FrameLayout>(R.id.voiceBox)!!
         voiceSpinner = findViewById<Spinner>(R.id.voiceSpinner)!!
-        speedLabel = findViewById<TextView>(R.id.speedLabel)!!
-        speedSeek = findViewById<SeekBar>(R.id.speedSeek)!!
         duckLabel = findViewById<TextView>(R.id.duckLabel)!!
         duckSeek = findViewById<SeekBar>(R.id.duckSeek)!!
         warnBox = findViewById<LinearLayout>(R.id.warnBox)!!
@@ -418,7 +424,6 @@ class MainActivity : Activity() {
     }
 
     private fun updateSliderLabels() {
-        speedLabel.text = "কণ্ঠের গতি: " + bn(String.format(Locale.US, "%.2f", baseRate)) + "x"
         duckLabel.text = "কণ্ঠ চলার সময় ভিডিওর আসল আওয়াজ: " + bn((duckLevel * 100f).roundToInt().toString()) + "%"
     }
 
@@ -870,19 +875,6 @@ class MainActivity : Activity() {
             { p ->
                 userSeeking = false
                 seekToMs(p.toLong())
-            }
-        ))
-
-        speedSeek.setOnSeekBarChangeListener(SimpleSeek(
-            { p, _ ->
-                baseRate = 0.7f + p / 100f
-                updateSliderLabels()
-            },
-            { },
-            { _ ->
-                prefs.edit().putFloat("rate", baseRate).apply()
-                regenerate()
-                flash("নতুন গতিতে কণ্ঠ তৈরি হচ্ছে…")
             }
         ))
 
@@ -1665,24 +1657,22 @@ class MainActivity : Activity() {
                 count = 1
             }
         }
-        for (k in out.indices) {
-            val u = out[k]
-            u.windowEnd = if (k + 1 < out.size) {
-                max(out[k + 1].startMs - MARGIN_MS, u.startMs + 300L)
+        for (u in out) u.text = finishSpeech(u.text)
+        val kept = out.filter { it.text.isNotBlank() }
+        for (k in kept.indices) {
+            val u = kept[k]
+            val n = kept.getOrNull(k + 1)
+            u.nextStartMs = if (n != null) max(n.startMs, u.startMs + 300L) else Long.MAX_VALUE / 4L
+            // বাক্য পড়া শেষে কতক্ষণ থামা হবে: পুরো বাক্য শেষ হলে একটু বেশি, মাঝপথে ভাঙলে একটু কম
+            u.pauseMs = if (endsSentence(u.text)) {
+                PAUSE_END_MS
+            } else if (n != null && list.getOrNull(n.firstCue)?.newSpeaker == true) {
+                PAUSE_SPEAKER_MS
             } else {
-                Long.MAX_VALUE / 4L
-            }
-            u.text = finishSpeech(u.text)
-        }
-        return out.filter { it.text.isNotBlank() }.let { kept ->
-            if (kept.size == out.size) out else {
-                for (k in kept.indices) {
-                    val u = kept[k]
-                    u.windowEnd = if (k + 1 < kept.size) max(kept[k + 1].startMs - MARGIN_MS, u.startMs + 300L) else Long.MAX_VALUE / 4L
-                }
-                kept
+                PAUSE_MID_MS
             }
         }
+        return kept
     }
 
     // ================= কণ্ঠ (Google TTS) =================
@@ -1875,15 +1865,17 @@ class MainActivity : Activity() {
             return
         }
         applyVoiceIfNeeded()
-        var clip = synth(unit.text, baseRate)
+        var clip = synth(unit.text, BASE_RATE)
         if (clip != null && clip.ok) {
-            // কণ্ঠ লম্বা হলে প্রথমে কণ্ঠ সামান্য দ্রুত করা হবে (সর্বোচ্চ ১২%), বাকিটা ভিডিও ধীর করে মেলানো হবে
-            // আগে শুরু করার সুযোগটুকুও (৩০০ মিলিসেকেন্ড) হিসাবে ধরা হয়
-            val window = unit.windowEnd - unit.startMs + MAX_EARLY_MS
-            if (window in 301L..100000L && clip.durMs > window + 150L) {
-                val factor = min(MAX_BOOST, clip.durMs.toFloat() / window.toFloat())
-                if (factor > 1.03f) {
-                    val faster = synth(unit.text, baseRate * factor)
+            // এই বাক্যের হাতে কতটা ভিডিও সময় আছে (পরের বাক্য শুরু পর্যন্ত), তার মধ্যে কথা আর বিরতি আঁটাতে হবে
+            val window = unit.nextStartMs - unit.startMs
+            if (window in 300L..600000L) {
+                val need = (clip.durMs + unit.pauseMs).toFloat() / window.toFloat()
+                // ব্যালেন্স: বাড়তি সময়ের অর্ধেক মেটাবে কণ্ঠ একটু দ্রুত পড়ে, বাকি অর্ধেক ভিডিও একটু ধীর হয়ে
+                // যেমন ২০% বেশি সময় লাগলে: কণ্ঠ প্রায় ১০% দ্রুত, ভিডিও প্রায় ১০% ধীর
+                val boost = min(VOICE_MAX, sqrt(need))
+                if (boost > 1.04f) {
+                    val faster = synth(unit.text, BASE_RATE * boost)
                     if (faster != null && faster.ok) clip = faster
                 }
             }
@@ -2046,8 +2038,14 @@ class MainActivity : Activity() {
         cache.remove(idx)
         nextSpeakIdx = idx + 1
         waitStart = 0L
+        // যতক্ষণ এই বাক্যের সাবটাইটেল স্ক্রিনে থাকবে, ততক্ষণ আসল আওয়াজ কম থাকবে
+        val u = units.getOrNull(idx)
+        if (u != null && u.lastEndMs > duckUntilPos) duckUntilPos = u.lastEndMs
         if (track != null) {
             speaking = Speaking(idx, track, clip.frames, clip.sampleRate, 0, SystemClock.uptimeMillis())
+        } else {
+            lastVoiceEndAt = SystemClock.uptimeMillis()
+            pauseNeeded = 0L
         }
         schedulePrep(nextSpeakIdx)
     }
@@ -2076,7 +2074,7 @@ class MainActivity : Activity() {
     private fun firstUnitFrom(list: List<SpeechUnit>, pos: Long): Int {
         for (k in list.indices) {
             val u = list[k]
-            val span = max(0L, min(u.windowEnd, u.lastEndMs) - u.startMs)
+            val span = max(0L, min(u.nextStartMs, u.lastEndMs) - u.startMs)
             val allow = min(700L, max(250L, span * 3L / 10L))
             if (pos <= u.startMs + allow) return k
         }
@@ -2087,7 +2085,10 @@ class MainActivity : Activity() {
         finishSpeaking()
         nextSpeakIdx = firstUnitFrom(units, pos)
         waitStart = 0L
-        duckHoldUntil = 0L
+        lastVoiceEndAt = 0L
+        pauseNeeded = 0L
+        duckUntilPos = -1L
+        debtMs = 0f
         lastShownIdx = -2
         if (::player.isInitialized) setSpeedNow(1f)
         schedulePrep(nextSpeakIdx)
@@ -2173,16 +2174,12 @@ class MainActivity : Activity() {
         statusText.text = text
     }
 
-    // কণ্ঠ বাক্যের সময়ের চেয়ে লম্বা হলে কতটা আগে শুরু করা হবে (সর্বোচ্চ ৩০০ মিলিসেকেন্ড)
-    private fun leadFor(u: SpeechUnit, clip: Clip): Long {
-        val extra = clip.durMs - (u.windowEnd - u.startMs)
-        return if (extra > 0L) min(MAX_EARLY_MS, max(60L, extra)) else 60L
-    }
-
     private fun tick() {
         if (!::player.isInitialized || released) return
         val now = SystemClock.uptimeMillis()
         val pos = player.currentPosition
+        val dt = if (lastTickAt > 0L) (now - lastTickAt).coerceIn(0L, 100L) else 0L
+        lastTickAt = now
         tickCount++
         updateSubtitleView(pos)
         if (tickCount % 5 == 0) updateTimeUi(pos)
@@ -2194,6 +2191,9 @@ class MainActivity : Activity() {
         val list = units
         val voiceOn = ttsReady
 
+        // ভিডিও ধীর চললে দেখতে সময় বেশি লাগে (ধার জমে), পরে সামান্য দ্রুত চললে সেই ধার শোধ হয়
+        debtMs = (debtMs + dt.toFloat() * (1f - appliedSpeed)).coerceIn(0f, MAX_DEBT_MS)
+
         // ১. চলতি কণ্ঠ শেষ হয়েছে কিনা দেখা
         val sp0 = speaking
         if (sp0 != null) {
@@ -2203,67 +2203,95 @@ class MainActivity : Activity() {
                 sp0.lastMoveAt = now
             }
             if (head >= sp0.frames - 1 || now - sp0.lastMoveAt > 1500L) {
+                val done = list.getOrNull(sp0.idx)
                 finishSpeaking()
-                // পরের বাক্য কাছেই থাকলে মাঝখানে ভিডিওর আওয়াজ হঠাৎ বেড়ে আবার কমবে না
+                lastVoiceEndAt = now
+                var p = done?.pauseMs ?: PAUSE_MID_MS
+                // কণ্ঠ আড়াই সেকেন্ডের বেশি পিছিয়ে পড়লে বিরতি ছোট করে তাড়াতাড়ি ধরে ফেলা
                 val nu = list.getOrNull(nextSpeakIdx)
-                val gap = if (nu != null) nu.startMs - pos else Long.MAX_VALUE
-                duckHoldUntil = if (gap in 0L..1200L) {
-                    now + (gap.toFloat() / max(curSpeed, 0.1f)).toLong() + 250L
-                } else {
-                    now + 300L
-                }
+                if (nu != null && pos - nu.startMs > 2500L) p = min(p, 200L)
+                pauseNeeded = p
             }
         }
 
-        // ২. সময় হলে পরের বাক্যের কণ্ঠ শুরু করা
-        var nextLead = 60L
+        // ২. বিরতি শেষ হলে আর ভিডিও পরের বাক্যের সময়ে পৌঁছালে, পরের বাক্যের কণ্ঠ শুরু
+        //    (আগে বিরতির হিসাব ছিল না, তাই একটা কণ্ঠ শেষ হওয়ামাত্র পরেরটা শুরু হয়ে যেত)
         if (voiceOn && speaking == null && nextSpeakIdx < list.size) {
             val u = list[nextSpeakIdx]
             val clip = cache[nextSpeakIdx]
             if (clip != null && !clip.ok) {
                 advance()
             } else if (clip != null) {
-                nextLead = leadFor(u, clip)
-                if (pos >= u.startMs - nextLead) startSpeaking(nextSpeakIdx, clip)
+                val pauseDone = now - lastVoiceEndAt >= pauseNeeded
+                if (pauseDone && pos >= u.startMs - LEAD_MS) startSpeaking(nextSpeakIdx, clip)
             } else if (pos >= u.startMs) {
                 if (waitStart == 0L) waitStart = now
-                if (now - waitStart > 3000L) advance()
+                if (now - waitStart > 4000L) advance()
             }
         }
 
-        // ৩. গণিত: বাকি কথা শেষ হতে যত সময় লাগবে, ঠিক তত সময়ে ভিডিও পরের বাক্যের কাছে পৌঁছাবে
-        //    ভিডিওর গতি = (পরের বাক্য পর্যন্ত বাকি ভিডিও সময়) / (বাকি কথার আসল সময়)
+        // ৩. গণিত: বাকি কথা আর তার পরের বিরতি শেষ হতে যত সময় লাগবে, ঠিক তত সময়ে ভিডিও পরের বাক্যে পৌঁছাবে
+        //    ভিডিওর গতি = (পরের বাক্য পর্যন্ত বাকি ভিডিও সময়) / (বাকি কথা + বিরতির আসল সময়)
         //    প্রতি ৩০ মিলিসেকেন্ডে নতুন করে মাপা হয়, তাই ভুল জমে না
         var target = 1f
-        val sp = speaking
-        if (sp != null) {
-            val u = list.getOrNull(sp.idx)
-            val remain = max(0, sp.frames - sp.lastHead).toLong() * 1000L / max(1, sp.sampleRate).toLong()
-            if (u != null && remain > 40L) {
-                val vRemain = u.windowEnd - pos
-                target = if (vRemain <= 0L) MIN_SPEED else (vRemain.toFloat() / remain.toFloat()).coerceIn(MIN_SPEED, 1f)
+        var late = 0L
+        var canSpeedUp = false
+        if (voiceOn && list.isNotEmpty()) {
+            val sp = speaking
+            val nIdx = if (sp != null) sp.idx + 1 else nextSpeakIdx
+            val nu = list.getOrNull(nIdx)
+            val goal = if (nu != null) {
+                nu.startMs - LEAD_MS
+            } else {
+                val d = player.duration
+                if (d > 0L) d - 300L else Long.MAX_VALUE / 4L
             }
-        } else if (voiceOn && nextSpeakIdx < list.size && !cache.containsKey(nextSpeakIdx)) {
-            val until = list[nextSpeakIdx].startMs - pos
-            target = if (until > 700L) 1f else if (until > 0L) 0.6f else WAIT_SPEED
+            val needReal = if (sp != null) {
+                val remain = max(0, sp.frames - sp.lastHead).toLong() * 1000L / max(1, sp.sampleRate).toLong()
+                remain + (list.getOrNull(sp.idx)?.pauseMs ?: PAUSE_MID_MS)
+            } else {
+                max(0L, lastVoiceEndAt + pauseNeeded - now)
+            }
+            val vLeft = goal - pos
+            if (vLeft < 0L) late = -vLeft
+            val waitingClip = sp == null && nu != null && !cache.containsKey(nIdx)
+            canSpeedUp = nu != null && !waitingClip
+            target = when {
+                waitingClip -> if (vLeft > 700L) 1f else SPEED_FLOOR
+                needReal <= 30L -> SPEED_UP_MAX
+                vLeft <= 0L -> 0f
+                else -> vLeft.toFloat() / needReal.toFloat()
+            }
         }
+        // ভিডিও কখনো থামবে না: সাধারণত সর্বনিম্ন ০.৭x, কণ্ঠ অনেক পিছিয়ে পড়লে অল্প সময়ের জন্য সর্বনিম্ন ০.৫৫x
+        val behind = ((late - 500L).toFloat() / 1500f).coerceIn(0f, 1f)
+        val floor = SPEED_FLOOR - (SPEED_FLOOR - SPEED_FLOOR_LATE) * behind
+        // আগে ভিডিও ধীর হয়ে থাকলে, ছোট বাক্য বা ফাঁকা সময়ে সামান্য দ্রুত চালিয়ে পুষিয়ে নেওয়া
+        // (উপরের হিসাবের কারণে এতেও দুই কণ্ঠের মাঝের বিরতি কাটা পড়ে না)
+        val ceil = if (canSpeedUp && debtMs > 150f) SPEED_UP_MAX else 1f
+        target = target.coerceIn(floor, ceil)
         // খুব সামান্য পার্থক্যে গতি বদলানো হবে না, এতে ভিডিও আরও মসৃণ চলে
-        if (target > 0.97f) target = 1f
+        if (target > 0.97f && target < 1.03f) target = 1f
 
-        // ৪. গতি হঠাৎ না বদলে ধীরে ধীরে বদলানো (কমানো দ্রুত, বাড়ানো নরমভাবে)
-        curSpeed = if (target < curSpeed) max(target, curSpeed - 0.10f) else min(target, curSpeed + 0.035f)
+        // ৪. গতি হঠাৎ না বদলে ধীরে ধীরে বদলানো (কমানো একটু দ্রুত, বাড়ানো নরমভাবে)
+        curSpeed = if (target < curSpeed) max(target, curSpeed - 0.08f) else min(target, curSpeed + 0.025f)
         if (abs(curSpeed - appliedSpeed) >= 0.02f || (curSpeed == target && curSpeed != appliedSpeed)) {
             player.playbackParameters = PlaybackParameters(curSpeed)
             appliedSpeed = curSpeed
         }
 
-        // ৫. ভিডিওর আসল আওয়াজ: কণ্ঠ শুরুর একটু আগেই ধীরে ধীরে কমবে, কণ্ঠ শেষে ধীরে ধীরে ফিরবে
-        val nu = list.getOrNull(nextSpeakIdx)
-        val preDuck = voiceOn && speaking == null && nu != null && cache[nextSpeakIdx]?.ok == true &&
-            pos >= nu.startMs - nextLead - 250L
-        var volTarget = if (speaking != null || now < duckHoldUntil || preDuck) duckLevel else 1f
-        // ভিডিও খুব ধীর হলে টেনে লম্বা হওয়া আসল আওয়াজ শুনতে খারাপ লাগে, তাই আরও কমানো
-        if (curSpeed < 0.7f) volTarget = min(volTarget, duckLevel * ((curSpeed - 0.25f) / 0.45f).coerceIn(0f, 1f))
+        // ৫. ভিডিওর আসল আওয়াজ: কণ্ঠ চলার সময়, সেই লাইন স্ক্রিনে থাকা পর্যন্ত,
+        //    আর দুই কণ্ঠের মাঝের ছোট বিরতিতে কম থাকবে, যাতে আসল কথা হঠাৎ জোরে ফিরে না আসে
+        val nx = list.getOrNull(nextSpeakIdx)
+        val gapToNext = if (nx != null) nx.startMs - pos else Long.MAX_VALUE
+        val sinceEnd = if (lastVoiceEndAt > 0L) now - lastVoiceEndAt else Long.MAX_VALUE
+        val approaching = voiceOn && speaking == null && nx != null && cache[nextSpeakIdx]?.ok == true &&
+            gapToNext <= LEAD_MS + 300L
+        val between = voiceOn && speaking == null && (sinceEnd < 250L || (sinceEnd < 4000L && gapToNext <= 1500L))
+        var volTarget = if (speaking != null || pos < duckUntilPos || approaching || between) duckLevel else 1f
+        // ভিডিও ধীর চললে টেনে লম্বা হওয়া আসল আওয়াজ শুনতে খারাপ লাগে, তাই কম রাখা
+        if (curSpeed < 0.9f) volTarget = min(volTarget, duckLevel)
+        if (curSpeed < 0.7f) volTarget = min(volTarget, duckLevel * ((curSpeed - 0.5f) / 0.2f).coerceIn(0f, 1f))
         curVol = if (volTarget < curVol) max(volTarget, curVol - 0.15f) else min(volTarget, curVol + 0.04f)
         if (abs(curVol - appliedVol) > 0.001f) {
             player.volume = curVol
