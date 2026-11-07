@@ -4,6 +4,24 @@ import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
 import android.app.Dialog
+import android.annotation.SuppressLint
+import android.content.BroadcastReceiver
+import android.content.ClipboardManager
+import android.content.Context
+import android.content.IntentFilter
+import android.graphics.Bitmap
+import android.media.AudioFocusRequest
+import android.util.TypedValue
+import android.webkit.JavascriptInterface
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLEncoder
+import org.json.JSONObject
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Environment
@@ -128,6 +146,12 @@ class MediaFile(
 
 class DirNode(val dir: File, val depth: Int)
 
+// YouTube লিংক থেকে পাওয়া তথ্য
+class YtLink(val id: String, val startMs: Long, val vertical: Boolean)
+
+// YouTube ভিডিওতে কোন বাক্যের কণ্ঠ কখন শুরু ও শেষ হবে তার হিসাব (ভিডিওর সময়ে)
+class YtPlan(val gen: Int, val start: Long, val end: Long)
+
 class SimpleSeek(
     private val onChange: (Int, Boolean) -> Unit,
     private val onStart: () -> Unit,
@@ -175,6 +199,12 @@ class MainActivity : Activity() {
         const val PRE_DUCK_MS = 500L     // বাংলা শুরুর এতটা আগে থেকে আসল আওয়াজ কমতে শুরু করবে
         const val FADE_OUT_MS = 450f     // আসল আওয়াজ নরমভাবে কমতে কত সময় লাগবে
         const val FADE_IN_MS = 1600f     // আসল আওয়াজ খুব ধীরে ধীরে ফিরে আসতে কত সময় লাগবে
+        const val YT_VOICE_MAX = 1.8f    // YouTube ভিডিওতে কণ্ঠ সর্বোচ্চ এতটা দ্রুত (ভিডিওর গতি কখনো বদলায় না)
+        const val YT_VOICE_MIN = 0.85f   // হাতে সময় বেশি থাকলে কণ্ঠ একটু ধীরে, শান্তভাবে পড়বে
+        const val YT_MIN_PAUSE_MS = 200L // পিছিয়ে পড়লে দুই বাক্যের মাঝে অন্তত এতটুকু বিরতি
+        const val YT_STALL_MS = 1200L    // এতক্ষণ YouTube-এর সময় না এগোলে ধরা হবে বিজ্ঞাপন বা লোড হচ্ছে
+        const val YT_GUESS_MS = 700L     // YouTube দুবার সময় জানানোর মাঝে সর্বোচ্চ এতটুকু সময় নিজে আন্দাজ করা হয়
+        const val YT_BASE_URL = "https://com.banglavoice.player/"
         const val JOIN_GAP_MS = 600L     // দুই লাইনের ফাঁক এর কম হলে একই বাক্য ধরা হবে
         const val MAX_JOIN_CUES = 3      // এক বাক্যে সর্বোচ্চ কয়টি লাইন
         const val MAX_JOIN_CHARS = 200   // এক বাক্যে সর্বোচ্চ কত অক্ষর
@@ -235,6 +265,38 @@ class MainActivity : Activity() {
     private var pickerToken = 0
     private var currentVideoBase = ""
 
+    // ---------- YouTube ----------
+    @Volatile private var ytMode = false         // এখন YouTube ভিডিও চলছে কিনা
+    private var ytView: WebView? = null
+    private var ytGen = 0
+    private var ytId = ""
+    private var ytVertical = false               // Shorts (খাড়া ভিডিও)
+    private var ytReady = false
+    private var ytState = -1
+    private var ytTime = 0L                      // YouTube শেষবার যে সময় জানিয়েছে
+    private var ytTimeAt = 0L                    // সেই সময়টা কখন বদলেছিল (ফোনের ঘড়িতে)
+    private var ytMono = 0L
+    @Volatile private var ytRate = 1f
+    private var ytDuration = 0L
+    private var ytWantPlay = false
+    private var ytPendingPlay = false
+    private var ytPendingSeek = -1L
+    private var ytPlaying = false
+    private var ytEnded = false
+    private var ytForeign = false
+    private var ytAppliedVol = -1
+    private var ytErrorShown = false
+    private var ytSeekTarget = -1L
+    private var ytSeekGuardUntil = 0L
+    private var ytFocusAskedAt = 0L
+    private var ytHasFocus = false
+    private var ytFocusByWeb = false
+    private var ytFocusReq: Any? = null
+    private var noisyRegistered = false
+    private var lockPass = false
+    private val ytPlans = ConcurrentHashMap<Int, YtPlan>()
+    @Volatile private var planFloor = 0L
+
     private lateinit var root: LinearLayout
     private lateinit var header: LinearLayout
     private lateinit var videoBox: FrameLayout
@@ -276,10 +338,17 @@ class MainActivity : Activity() {
     private lateinit var fsMute: Button
     private lateinit var lockBtn: TextView
     private lateinit var muteSwitch: Switch
+    private lateinit var btnYt: Button
+    private lateinit var ytBtns: LinearLayout
+    private lateinit var ytMuteBtn: TextView
+    private lateinit var ytFullBtn: TextView
 
     private val hideBarRunnable = Runnable {
-        if (isFullscreen && ::player.isInitialized && player.isPlaying && !userSeeking) setFsBar(false)
+        if (isFullscreen && !ytMode && isVideoPlaying() && !userSeeking) setFsBar(false)
     }
+
+    // অ্যাপ পেছনে গেলে YouTube পাতার ভেতরের কাজও ঘুমিয়ে পড়বে, ব্যাটারি খরচ হবে না
+    private val pauseTimersRunnable = Runnable { ytView?.pauseTimers() }
 
     // লক অবস্থায় দেখানো 🔒 চিহ্ন কিছুক্ষণ পর নিজে লুকিয়ে যাবে
     private val hideLockRunnable = Runnable {
@@ -316,6 +385,7 @@ class MainActivity : Activity() {
         muteFade = if (muteOriginal) 0f else 1f
         muteSwitch.isChecked = muteOriginal
         fsMute.text = if (muteOriginal) "🔇" else "🔊"
+        ytMuteBtn.text = fsMute.text
         setupPlayer()
         setupControls()
         setupGestures()
@@ -326,6 +396,8 @@ class MainActivity : Activity() {
         // প্রতিবার অ্যাপ খুললে নতুন করে শুরু: আগের ভিডিও/সাবটাইটেল মনে রাখা হবে না
         // কণ্ঠের গতি এখন অ্যাপ নিজেই ঠিক করে, তাই আগে হাতে বাছা গতি আর পুরনো ১০% আওয়াজের সেটিংও মুছে ফেলা হয়
         prefs.edit().remove("video").remove("srt").remove("pos").remove("rate").remove("duck").apply()
+        // YouTube অ্যাপ থেকে শেয়ার করে অ্যাপ খুললে সেই ভিডিও চলবে
+        handleShareIntent(intent)
     }
 
     private fun bindViews() {
@@ -370,6 +442,10 @@ class MainActivity : Activity() {
         fsMute = findViewById<Button>(R.id.fsMute)!!
         lockBtn = findViewById<TextView>(R.id.lockBtn)!!
         muteSwitch = findViewById<Switch>(R.id.muteSwitch)!!
+        btnYt = findViewById<Button>(R.id.btnYt)!!
+        ytBtns = findViewById<LinearLayout>(R.id.ytBtns)!!
+        ytMuteBtn = findViewById<TextView>(R.id.ytMute)!!
+        ytFullBtn = findViewById<TextView>(R.id.ytFull)!!
     }
 
     // ================= ডিজাইন =================
@@ -403,6 +479,7 @@ class MainActivity : Activity() {
         styleButton(btnFull, surface2)
         styleButton(btnVideo, surface2)
         styleButton(btnSrt, surface2)
+        styleButton(btnYt, 0xFF9F1239.toInt())
         styleButton(btnInstall, warn)
         cardFiles.background = rounded(surface, 18f)
         cardVoice.background = rounded(surface, 18f)
@@ -411,6 +488,8 @@ class MainActivity : Activity() {
         subtitleView.background = rounded(0xB3000000.toInt(), 10f)
         exitFull.background = rounded(0x80000000.toInt(), 22f)
         lockBtn.background = rounded(0x80000000.toInt(), 22f)
+        ytMuteBtn.background = rounded(0x33FFFFFF, 22f)
+        ytFullBtn.background = rounded(0x33FFFFFF, 22f)
         voiceSpinner.backgroundTintList = ColorStateList.valueOf(Color.WHITE)
 
         // ফুলস্ক্রিনের নিচের কন্ট্রোল বার
@@ -515,6 +594,11 @@ class MainActivity : Activity() {
         val lp = videoBox.layoutParams as LinearLayout.LayoutParams
         val wanted = if (isFullscreen) {
             rh
+        } else if (ytMode) {
+            // YouTube: ভিডিও, আর তার নিচে লেখার কালো পট্টি
+            val strip = ytStripPx()
+            val ph = if (ytVertical) min((rw * 16f / 9f).roundToInt(), (rh * 0.6f).roundToInt()) else (rw * 9f / 16f).roundToInt()
+            min(ph + strip, (rh * 0.72f).roundToInt())
         } else {
             val ratio = if (videoW > 0 && videoH > 0) videoH.toFloat() / videoW.toFloat() else 9f / 16f
             min((rw * ratio).roundToInt(), (rh * 0.55f).roundToInt())
@@ -527,6 +611,10 @@ class MainActivity : Activity() {
     }
 
     private fun fitSurface() {
+        if (ytMode) {
+            fitYt()
+            return
+        }
         val bw = videoBox.width
         val bh = videoBox.height
         if (bw <= 0 || bh <= 0) return
@@ -571,7 +659,7 @@ class MainActivity : Activity() {
             header.visibility = View.GONE
             panel.visibility = View.GONE
             root.setPadding(0, 0, 0, 0)
-            subtitleView.textSize = 22f
+            if (!ytMode) subtitleView.textSize = 22f
             requestedOrientation = if (videoW > 0 && videoW < videoH) {
                 ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
             } else {
@@ -582,11 +670,12 @@ class MainActivity : Activity() {
         } else {
             header.visibility = View.VISIBLE
             panel.visibility = View.VISIBLE
-            subtitleView.textSize = 18f
+            if (!ytMode) subtitleView.textSize = 18f
             requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
             showSystemBars()
             setFsBar(false)
         }
+        if (ytMode) applyYtStripLayout()
         root.requestApplyInsets()
         handler.post { applyLayout() }
     }
@@ -594,11 +683,11 @@ class MainActivity : Activity() {
     // ফুলস্ক্রিনের নিচের কন্ট্রোল বার (ভিডিও টানার লাইন সহ) দেখানো বা লুকানো
     private fun setFsBar(show: Boolean) {
         handler.removeCallbacks(hideBarRunnable)
-        if (show && isFullscreen) {
+        if (show && isFullscreen && !ytMode) {
             fsBarVisible = true
             fsBar.visibility = View.VISIBLE
             exitFull.visibility = View.VISIBLE
-            updateTimeUi(player.currentPosition)
+            updateTimeUi(curPos())
             fsBar.post {
                 if (fsBarVisible) subtitleView.animate().translationY(-fsBar.height.toFloat()).setDuration(150L).start()
             }
@@ -626,9 +715,9 @@ class MainActivity : Activity() {
     private fun refreshLockBtn() {
         if (isLocked) return
         handler.removeCallbacks(hideLockRunnable)
-        val hasVideo = ::player.isInitialized && player.mediaItemCount > 0
         lockBtn.text = "🔓"
-        lockBtn.visibility = if (hasVideo && (!isFullscreen || fsBarVisible)) View.VISIBLE else View.GONE
+        // YouTube-এ 🔓 সবসময় ভিডিওর নিচের পট্টিতে থাকে
+        lockBtn.visibility = if (hasVideo() && (ytMode || !isFullscreen || fsBarVisible)) View.VISIBLE else View.GONE
     }
 
     // লক অবস্থায় স্ক্রিনে ছুঁলে শুধু 🔒 চিহ্নটা আড়াই সেকেন্ডের জন্য দেখা যাবে, আর কিছু না
@@ -650,6 +739,7 @@ class MainActivity : Activity() {
             refreshLockBtn()
             if (isFullscreen) setFsBar(true)
         }
+        if (ytMode) ytBtns.visibility = if (v) View.GONE else View.VISIBLE
     }
 
     private fun touchOnView(v: View, ev: MotionEvent): Boolean {
@@ -660,10 +750,27 @@ class MainActivity : Activity() {
             ev.rawY >= loc[1] - slop && ev.rawY <= loc[1] + v.height + slop
     }
 
+    private fun touchInside(v: View, ev: MotionEvent): Boolean {
+        if (v.visibility != View.VISIBLE || v.width <= 0) return false
+        val loc = IntArray(2)
+        v.getLocationOnScreen(loc)
+        return ev.rawX >= loc[0] && ev.rawX < loc[0] + v.width && ev.rawY >= loc[1] && ev.rawY < loc[1] + v.height
+    }
+
     // লক চালু থাকলে স্ক্রিনের কোনো ছোঁয়া ভিডিও বা বোতাম পর্যন্ত যাবে না
     // শুধু 🔒 চিহ্নটা দেখা গেলে সেটায় ট্যাপ করলে লক খুলবে
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
         if (!isLocked) return super.dispatchTouchEvent(ev)
+        // YouTube: লক থাকলেও ভিডিওর অংশটা YouTube-এর নিজের (ওদের নিয়ম), তাই ওখানের ছোঁয়া YouTube পাবে
+        if (ev.actionMasked == MotionEvent.ACTION_DOWN) {
+            val yv = ytView
+            lockPass = ytMode && yv != null && touchInside(yv, ev)
+        }
+        if (lockPass) {
+            val r = super.dispatchTouchEvent(ev)
+            if (ev.actionMasked == MotionEvent.ACTION_UP || ev.actionMasked == MotionEvent.ACTION_CANCEL) lockPass = false
+            return r
+        }
         when (ev.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 lockDownInside = lockBtn.visibility == View.VISIBLE && touchOnView(lockBtn, ev)
@@ -691,7 +798,8 @@ class MainActivity : Activity() {
         }
         if (muteSwitch.isChecked != v) muteSwitch.isChecked = v
         fsMute.text = if (v) "🔇" else "🔊"
-        if (::player.isInitialized && !player.isPlaying) applyVolumeNow()
+        ytMuteBtn.text = fsMute.text
+        if (!isVideoPlaying()) applyVolumeNow()
     }
 
     // স্ক্রিনে সাবটাইটেলের লেখা দেখানো চালু/বন্ধ (কণ্ঠ সবসময় চলবে)
@@ -704,7 +812,7 @@ class MainActivity : Activity() {
         if (subsSwitch.isChecked != v) subsSwitch.isChecked = v
         fsSubs.alpha = if (v) 1f else 0.45f
         lastShownIdx = -2
-        if (::player.isInitialized) updateSubtitleView(player.currentPosition)
+        updateSubtitleView(curPos())
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -744,6 +852,9 @@ class MainActivity : Activity() {
         handler.removeCallbacksAndMessages(null)
         pickerToken++
         finishSpeaking()
+        destroyYtView()
+        ytAbandonFocus()
+        unregisterNoisy()
         if (::player.isInitialized) {
             try {
                 player.stop()
@@ -793,15 +904,18 @@ class MainActivity : Activity() {
         player.setVideoSurfaceView(surfaceView)
         player.addListener(object : Player.Listener {
             override fun onIsPlayingChanged(isPlaying: Boolean) {
+                if (ytMode) return
                 onPlayingChanged(isPlaying)
             }
 
             override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+                if (ytMode) return
                 btnPlay.text = if (playWhenReady) "⏸  থামান" else "▶  চালান"
                 fsPlay.text = if (playWhenReady) "⏸" else "▶"
             }
 
             override fun onPlaybackStateChanged(playbackState: Int) {
+                if (ytMode) return
                 if (playbackState == Player.STATE_READY) {
                     emptyHint.visibility = View.GONE
                     updateTimeUi(player.currentPosition)
@@ -813,6 +927,7 @@ class MainActivity : Activity() {
             }
 
             override fun onVideoSizeChanged(videoSize: VideoSize) {
+                if (ytMode) return
                 if (videoSize.width > 0 && videoSize.height > 0) {
                     videoW = (videoSize.width * videoSize.pixelWidthHeightRatio).roundToInt()
                     videoH = videoSize.height
@@ -821,6 +936,7 @@ class MainActivity : Activity() {
             }
 
             override fun onPlayerError(error: PlaybackException) {
+                if (ytMode) return
                 flash("এই ভিডিওটি চালানো যাচ্ছে না। অন্য ভিডিও চেষ্টা করুন।")
             }
         })
@@ -839,7 +955,8 @@ class MainActivity : Activity() {
                 }
             }
         } else {
-            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            // YouTube-এ বিজ্ঞাপন বা লোড হওয়ার সময়ও স্ক্রিন জ্বলে থাকবে
+            if (!(ytMode && ytWantPlay)) window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             if (sp != null) {
                 try {
                     sp.track.pause()
@@ -852,10 +969,24 @@ class MainActivity : Activity() {
     private fun setSpeedNow(s: Float) {
         curSpeed = s
         appliedSpeed = s
-        player.playbackParameters = PlaybackParameters(s)
+        // YouTube ভিডিওর গতি কখনো বদলানো হয় না
+        if (!ytMode && ::player.isInitialized) player.playbackParameters = PlaybackParameters(s)
     }
 
     private fun togglePlay() {
+        if (ytMode) {
+            if (ytWantPlay) {
+                ytPause()
+            } else {
+                if (cues.isEmpty()) flash("SRT ফাইল দেওয়া হয়নি, শুধু ভিডিও চলবে।")
+                if (ytEnded) {
+                    ytSeekTo(0L)
+                    resetSpeech(0L)
+                }
+                ytPlay()
+            }
+            return
+        }
         if (player.mediaItemCount == 0) {
             flash("আগে একটি ভিডিও বেছে নিন।")
             return
@@ -873,6 +1004,14 @@ class MainActivity : Activity() {
     }
 
     private fun seekToMs(ms: Long) {
+        if (ytMode) {
+            if (ytId.isEmpty()) return
+            val d = ytDuration
+            val t = ms.coerceIn(0L, if (d > 0L) max(0L, d - 500L) else Long.MAX_VALUE)
+            ytSeekTo(t)
+            resetSpeech(t)
+            return
+        }
         if (player.mediaItemCount == 0) return
         val dur = player.duration
         val maxPos = if (dur > 0L) dur else Long.MAX_VALUE
@@ -889,14 +1028,14 @@ class MainActivity : Activity() {
 
     private fun nextSubtitle() {
         val starts = jumpStarts()
-        val pos = player.currentPosition
+        val pos = curPos()
         val idx = starts.indexOfFirst { it > pos + 50L }
         if (idx >= 0) seekToMs(starts[idx])
     }
 
     private fun prevSubtitle() {
         val starts = jumpStarts()
-        val pos = player.currentPosition
+        val pos = curPos()
         val idx = starts.indexOfLast { it < pos - 800L }
         if (idx >= 0) seekToMs(starts[idx]) else seekToMs(0L)
     }
@@ -906,7 +1045,7 @@ class MainActivity : Activity() {
             override fun onDown(e: MotionEvent): Boolean = true
 
             override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
-                if (isFullscreen) setFsBar(!fsBarVisible) else togglePlay()
+                if (isFullscreen && !ytMode) setFsBar(!fsBarVisible) else togglePlay()
                 return true
             }
 
@@ -936,8 +1075,11 @@ class MainActivity : Activity() {
 
     private fun setupControls() {
         btnPlay.setOnClickListener { togglePlay() }
-        btnBack.setOnClickListener { seekToMs(player.currentPosition - 10000L) }
-        btnFwd.setOnClickListener { seekToMs(player.currentPosition + 10000L) }
+        btnBack.setOnClickListener { seekToMs(curPos() - 10000L) }
+        btnFwd.setOnClickListener { seekToMs(curPos() + 10000L) }
+        btnYt.setOnClickListener { showYtDialog() }
+        ytMuteBtn.setOnClickListener { setMuteOriginal(!muteOriginal) }
+        ytFullBtn.setOnClickListener { toggleFullscreen() }
         btnFull.setOnClickListener { toggleFullscreen() }
         exitFull.setOnClickListener { toggleFullscreen() }
         btnVideo.setOnClickListener { requestPick(PICK_VIDEO) }
@@ -960,11 +1102,11 @@ class MainActivity : Activity() {
             bumpFsBar()
         }
         fsBack.setOnClickListener {
-            seekToMs(player.currentPosition - 10000L)
+            seekToMs(curPos() - 10000L)
             bumpFsBar()
         }
         fsFwd.setOnClickListener {
-            seekToMs(player.currentPosition + 10000L)
+            seekToMs(curPos() + 10000L)
             bumpFsBar()
         }
         fsSeek.setOnSeekBarChangeListener(SimpleSeek(
@@ -1195,6 +1337,8 @@ class MainActivity : Activity() {
         val v = currentVideoBase
         if (v.isEmpty()) return false
         val s = srtName.substringBeforeLast('.').lowercase(Locale.US).trim()
+        // YouTube: ফাইলের নামে ভিডিওর ID থাকলেও মিলবে
+        if (ytMode && ytId.isNotEmpty() && s.contains(ytId.lowercase(Locale.US))) return true
         if (s == v) return true
         for (sep in listOf(".", "_", " ", "-", "(", "[")) {
             if (s.startsWith(v + sep)) return true
@@ -1473,6 +1617,7 @@ class MainActivity : Activity() {
     }
 
     private fun loadVideo(uri: Uri, startAt: Long) {
+        exitYtMode()
         player.setMediaItem(MediaItem.fromUri(uri))
         player.prepare()
         if (startAt > 0L) player.seekTo(startAt)
@@ -1500,7 +1645,7 @@ class MainActivity : Activity() {
         units = built
         failCount = 0
         srtName.text = "📄 " + displayName(uri) + " · " + bn(parsed.size.toString()) + "টি লাইন"
-        resetSpeech(if (player.mediaItemCount > 0) player.currentPosition else 0L)
+        resetSpeech(if (hasVideo()) curPos() else 0L)
         return true
     }
 
@@ -1938,6 +2083,12 @@ class MainActivity : Activity() {
     private fun regenerate() {
         prepGen++
         cache.clear()
+        if (ytMode) {
+            // শেষ যে বাক্যটা শুরু হয়েছে তার হিসাব রেখে বাকিগুলো নতুন করে
+            val keep = ytPlans[nextSpeakIdx - 1]
+            ytPlans.clear()
+            if (keep != null) ytPlans[nextSpeakIdx - 1] = YtPlan(prepGen, keep.start, keep.end)
+        }
         schedulePrep(nextSpeakIdx)
     }
 
@@ -1982,7 +2133,9 @@ class MainActivity : Activity() {
         }
         applyVoiceIfNeeded()
         var clip = synth(unit.text, BASE_RATE)
-        if (clip != null && clip.ok) {
+        if (ytMode) {
+            clip = fitYtClip(i, gen, unit, clip, list)
+        } else if (clip != null && clip.ok) {
             // এই বাক্যের হাতে কতটা ভিডিও সময় আছে (পরের বাক্য শুরু পর্যন্ত), তার মধ্যে কথা আর বিরতি আঁটাতে হবে
             val window = unit.nextStartMs - unit.startMs
             if (window in 300L..600000L) {
@@ -2154,6 +2307,7 @@ class MainActivity : Activity() {
         cache.remove(idx)
         nextSpeakIdx = idx + 1
         waitStart = 0L
+        if (ytMode) ytAfterStart(idx, clip)
         if (track != null) {
             speaking = Speaking(idx, track, clip.frames, clip.sampleRate, 0, SystemClock.uptimeMillis())
         } else {
@@ -2196,6 +2350,13 @@ class MainActivity : Activity() {
 
     private fun resetSpeech(pos: Long) {
         finishSpeaking()
+        if (ytMode) {
+            // YouTube: নতুন জায়গা থেকে সময়ের হিসাব নতুন করে, তাই আগে তৈরি কণ্ঠগুলো বাদ
+            prepGen++
+            cache.clear()
+            ytPlans.clear()
+            planFloor = pos + 300L
+        }
         nextSpeakIdx = firstUnitFrom(units, pos)
         waitStart = 0L
         lastVoiceEndAt = 0L
@@ -2244,7 +2405,7 @@ class MainActivity : Activity() {
     }
 
     private fun updateTimeUi(pos: Long) {
-        val dur = player.duration
+        val dur = videoDuration()
         if (dur > 0L) {
             val d = min(dur, Int.MAX_VALUE.toLong()).toInt()
             if (seekBar.max != d) seekBar.max = d
@@ -2274,9 +2435,12 @@ class MainActivity : Activity() {
         val us = units
         val n = bn(list.size.toString())
         var text = when {
-            player.mediaItemCount == 0 && list.isEmpty() -> "শুরু করতে ভিডিও আর SRT ফাইল বেছে নিন।"
+            !hasVideo() && list.isEmpty() -> "শুরু করতে ভিডিও আর SRT ফাইল বেছে নিন।"
             list.isEmpty() -> "এখন SRT ফাইল বেছে নিন।"
-            player.mediaItemCount == 0 -> "এখন ভিডিও বেছে নিন।"
+            !hasVideo() -> "এখন ভিডিও বেছে নিন।"
+            ytMode && !ytReady -> "⏳ YouTube ভিডিও লোড হচ্ছে…"
+            ytMode && ytForeign -> "⚠ YouTube অন্য ভিডিও চালাচ্ছে, আপনার SRT মিলবে না, তাই বাংলা পড়া বন্ধ"
+            ytMode && ytWantPlay && !ytPlaying -> "⏳ ভিডিও লোড হচ্ছে বা বিজ্ঞাপন চলছে · শেষ হলে বাংলা পড়া চলবে"
             ttsFailed -> "⚠ কণ্ঠ ইঞ্জিন চালু হয়নি, শুধু ভিডিও আর লেখা চলবে।"
             !ttsReady -> "কণ্ঠ ইঞ্জিন চালু হচ্ছে…"
             nextSpeakIdx >= us.size && speaking == null -> n + "টি সাবটাইটেল · সব লাইন পড়া শেষ"
@@ -2291,7 +2455,8 @@ class MainActivity : Activity() {
     private fun timeToNextVoice(nx: SpeechUnit?, pos: Long, now: Long): Long {
         if (nx == null) return Long.MAX_VALUE / 4L
         val vLeft = nx.startMs - LEAD_MS - pos
-        val byVideo = if (vLeft <= 0L) 0L else (vLeft.toFloat() / max(curSpeed, 0.5f)).toLong()
+        val spd = if (ytMode) ytRate else curSpeed
+        val byVideo = if (vLeft <= 0L) 0L else (vLeft.toFloat() / max(spd, 0.25f)).toLong()
         val pauseLeft = max(0L, lastVoiceEndAt + pauseNeeded - now)
         return max(byVideo, pauseLeft)
     }
@@ -2299,7 +2464,8 @@ class MainActivity : Activity() {
     private fun tick() {
         if (!::player.isInitialized || released) return
         val now = SystemClock.uptimeMillis()
-        val pos = player.currentPosition
+        if (ytMode) ytCheckPlaying(now)
+        val pos = curPos()
         val dt = if (lastTickAt > 0L) (now - lastTickAt).coerceIn(0L, 100L) else 0L
         lastTickAt = now
         tickCount++
@@ -2309,9 +2475,9 @@ class MainActivity : Activity() {
             refreshStatus(now)
             schedulePrep(nextSpeakIdx)
         }
-        if (!player.isPlaying) return
+        if (!isVideoPlaying()) return
         val list = units
-        val voiceOn = ttsReady
+        val voiceOn = ttsReady && !(ytMode && ytForeign)
 
         // ভিডিও ধীর চললে দেখতে সময় বেশি লাগে (ধার জমে), পরে সামান্য দ্রুত চললে সেই ধার শোধ হয়
         debtMs = (debtMs + dt.toFloat() * (1f - appliedSpeed)).coerceIn(0f, MAX_DEBT_MS)
@@ -2329,9 +2495,17 @@ class MainActivity : Activity() {
                 finishSpeaking()
                 lastVoiceEndAt = now
                 var p = done?.pauseMs ?: PAUSE_MID_MS
-                // কণ্ঠ আড়াই সেকেন্ডের বেশি পিছিয়ে পড়লে বিরতি ছোট করে তাড়াতাড়ি ধরে ফেলা
                 val nu = list.getOrNull(nextSpeakIdx)
-                if (nu != null && pos - nu.startMs > 2500L) p = min(p, 200L)
+                if (ytMode) {
+                    // YouTube: ভিডিও থামে না, তাই কণ্ঠ পিছিয়ে পড়লে বিরতি ছোট হয় (সবচেয়ে কম ০.২ সেকেন্ড)
+                    if (nu != null) {
+                        val room = ((nu.startMs - LEAD_MS - pos).toFloat() / ytRate).toLong()
+                        p = room.coerceIn(YT_MIN_PAUSE_MS, max(p, YT_MIN_PAUSE_MS))
+                    }
+                } else if (nu != null && pos - nu.startMs > 2500L) {
+                    // কণ্ঠ আড়াই সেকেন্ডের বেশি পিছিয়ে পড়লে বিরতি ছোট করে তাড়াতাড়ি ধরে ফেলা
+                    p = min(p, 200L)
+                }
                 pauseNeeded = p
                 // পরের বাংলা কথা ২ সেকেন্ডের মধ্যেই এলে মাঝখানে আসল আওয়াজ ফিরবে না
                 val gap = timeToNextVoice(nu, pos, now)
@@ -2350,8 +2524,14 @@ class MainActivity : Activity() {
                 if (pauseDone && pos >= u.startMs - LEAD_MS) startSpeaking(nextSpeakIdx, clip)
             } else if (pos >= u.startMs) {
                 if (waitStart == 0L) waitStart = now
-                if (now - waitStart > 4000L) advance()
+                if (now - waitStart > (if (ytMode) 6000L else 4000L)) advance()
             }
+        }
+
+        if (ytMode) {
+            // YouTube ভিডিওর গতি কখনো বদলানো হয় না, শুধু আসল আওয়াজ সামলানো
+            updateVolume(list, voiceOn, pos, now, dt)
+            return
         }
 
         // ৩. গণিত: বাকি কথা আর তার পরের বিরতি শেষ হতে যত সময় লাগবে, ঠিক তত সময়ে ভিডিও পরের বাক্যে পৌঁছাবে
@@ -2367,7 +2547,7 @@ class MainActivity : Activity() {
             val goal = if (nu != null) {
                 nu.startMs - LEAD_MS
             } else {
-                val d = player.duration
+                val d = videoDuration()
                 if (d > 0L) d - 300L else Long.MAX_VALUE / 4L
             }
             val needReal = if (sp != null) {
@@ -2436,6 +2616,11 @@ class MainActivity : Activity() {
 
     private fun setGain(g: Float) {
         curVol = g.coerceIn(0f, 1f)
+        if (ytMode) {
+            setYtVolume(curVol)
+            appliedVol = curVol
+            return
+        }
         if (abs(curVol - appliedVol) > 0.001f || (curVol == 0f && appliedVol != 0f)) {
             player.volume = curVol
             appliedVol = curVol
@@ -2444,9 +2629,873 @@ class MainActivity : Activity() {
 
     // ভিডিও থামানো অবস্থায় আওয়াজ বন্ধ/চালু করলে সাথে সাথে লাগানো
     private fun applyVolumeNow() {
-        if (!::player.isInitialized) return
+        if (!::player.isInitialized && !ytMode) return
         muteFade = if (muteOriginal) 0f else 1f
         setGain(muteFade * (duckLevel + (1f - duckLevel) * fadePos * fadePos))
+    }
+
+    // ================= YouTube ভিডিও (নামাতে হয় না, সরাসরি চলে) =================
+    // YouTube-এর নিজের প্লেয়ার অ্যাপের ভেতরে চলে। ভিডিওর গতি কখনো বদলানো হয় না,
+    // বাংলা কণ্ঠ নিজের গতি কমিয়ে-বাড়িয়ে (০.৮৫x থেকে ১.৮x) ভিডিওর সাথে মেলে
+
+    private fun hasVideo(): Boolean {
+        return if (ytMode) ytId.isNotEmpty() else (::player.isInitialized && player.mediaItemCount > 0)
+    }
+
+    private fun curPos(): Long {
+        return if (ytMode) ytPos() else if (::player.isInitialized) player.currentPosition else 0L
+    }
+
+    private fun isVideoPlaying(): Boolean {
+        return if (ytMode) ytPlaying else (::player.isInitialized && player.isPlaying)
+    }
+
+    private fun videoDuration(): Long {
+        return if (ytMode) ytDuration else if (::player.isInitialized) player.duration else 0L
+    }
+
+    private fun updatePlayButtons(playing: Boolean) {
+        btnPlay.text = if (playing) "⏸  থামান" else "▶  চালান"
+        fsPlay.text = if (playing) "⏸" else "▶"
+    }
+
+    // ---------- লিংক থেকে ভিডিওর পরিচয় (ID) বের করা ----------
+
+    private fun isYtIdChar(c: Char): Boolean {
+        return c in 'a'..'z' || c in 'A'..'Z' || c in '0'..'9' || c == '-' || c == '_'
+    }
+
+    private fun takeYtId(s: String, from: Int): String? {
+        if (from < 0 || from + 11 > s.length) return null
+        val id = s.substring(from, from + 11)
+        if (!id.all { isYtIdChar(it) }) return null
+        if (from + 11 < s.length && isYtIdChar(s[from + 11])) return null
+        return id
+    }
+
+    // লিংকের t=90 বা t=1m30s থেকে শুরুর সময়
+    private fun parseYtStart(text: String): Long {
+        for (key in listOf("?t=", "&t=", "#t=", "?start=", "&start=")) {
+            val at = text.indexOf(key)
+            if (at < 0) continue
+            var i = at + key.length
+            var total = 0L
+            var num = 0L
+            var any = false
+            while (i < text.length) {
+                val c = text[i]
+                if (c in '0'..'9') {
+                    num = num * 10L + (c - '0')
+                    any = true
+                } else if (c == 'h') {
+                    total += num * 3600L
+                    num = 0L
+                } else if (c == 'm') {
+                    total += num * 60L
+                    num = 0L
+                } else if (c == 's') {
+                    total += num
+                    num = 0L
+                } else {
+                    break
+                }
+                i++
+            }
+            total += num
+            if (any) return total * 1000L
+        }
+        return 0L
+    }
+
+    private fun parseYtLink(raw: String): YtLink? {
+        val text = raw.trim()
+        if (text.isEmpty()) return null
+        if (text.contains("youtu", ignoreCase = true)) {
+            val markers = listOf("youtu.be/", "/shorts/", "/watch?v=", "?v=", "&v=", "/live/", "/embed/", "/v/")
+            for (m in markers) {
+                var at = text.indexOf(m)
+                while (at >= 0) {
+                    val id = takeYtId(text, at + m.length)
+                    if (id != null) return YtLink(id, parseYtStart(text), m == "/shorts/")
+                    at = text.indexOf(m, at + 1)
+                }
+            }
+        }
+        // শুধু ১১ অক্ষরের ID দিলেও চলবে
+        if (text.length == 11 && text.all { isYtIdChar(it) }) return YtLink(text, 0L, false)
+        return null
+    }
+
+    // ---------- লিংক দেওয়ার জানালা ----------
+
+    private fun clipText(): String {
+        return try {
+            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            val c = cm.primaryClip
+            if (c != null && c.itemCount > 0) (c.getItemAt(0).coerceToText(this)?.toString() ?: "") else ""
+        } catch (e: Exception) {
+            ""
+        }
+    }
+
+    private fun showYtDialog() {
+        val pad = dp(22f).toInt()
+        val box = LinearLayout(this)
+        box.orientation = LinearLayout.VERTICAL
+        box.setPadding(pad, dp(8f).toInt(), pad, 0)
+
+        val info = TextView(this)
+        info.text = "YouTube ভিডিওর লিংক নিচে পেস্ট করুন। ভিডিও নামাতে হবে না, সরাসরি চলবে।" + NL + NL +
+            "আরও সহজ: YouTube অ্যাপে ভিডিওর নিচে “শেয়ার” চেপে “বাংলা ভয়েস প্লেয়ার” বাছুন।"
+        info.setTextColor(getColor(R.color.text))
+        info.textSize = 14f
+
+        val input = EditText(this)
+        input.hint = "https://youtu.be/…"
+        input.setSingleLine(true)
+        input.setTextColor(Color.WHITE)
+        input.setHintTextColor(getColor(R.color.textDim))
+        input.textSize = 15f
+        val ilp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        ilp.topMargin = dp(14f).toInt()
+        input.layoutParams = ilp
+
+        val paste = Button(this)
+        paste.text = "📋 পেস্ট করুন"
+        styleButton(paste, getColor(R.color.surface2))
+        val plp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(46f).toInt())
+        plp.topMargin = dp(8f).toInt()
+        paste.layoutParams = plp
+        paste.setOnClickListener {
+            val c = clipText().trim()
+            if (c.isEmpty()) input.error = "ক্লিপবোর্ডে কোনো লেখা নেই" else input.setText(c)
+        }
+
+        box.addView(info)
+        box.addView(input)
+        box.addView(paste)
+
+        // কপি করা লিংক থাকলে নিজে থেকেই বসে যাবে
+        val copied = clipText().trim()
+        if (parseYtLink(copied) != null) input.setText(copied)
+
+        val dlg = AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+            .setTitle("▶ YouTube ভিডিও চালান")
+            .setView(box)
+            .setPositiveButton("▶ চালান", null)
+            .setNegativeButton("বাতিল", null)
+            .create()
+        dlg.setOnShowListener {
+            dlg.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val link = parseYtLink(input.text.toString())
+                if (link == null) {
+                    input.error = "এটা YouTube ভিডিওর লিংক নয়"
+                } else {
+                    dlg.dismiss()
+                    openYoutube(link)
+                }
+            }
+        }
+        dlg.show()
+    }
+
+    // YouTube অ্যাপ থেকে "শেয়ার" করে পাঠানো লিংক
+    private fun handleShareIntent(i: Intent?) {
+        if (i == null || i.action != Intent.ACTION_SEND) return
+        val text = i.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString() ?: ""
+        i.action = Intent.ACTION_MAIN
+        val link = parseYtLink(text)
+        if (link == null) {
+            flash("শেয়ার করা লেখায় YouTube ভিডিওর লিংক পাওয়া যায়নি।")
+            return
+        }
+        openYoutube(link)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleShareIntent(intent)
+    }
+
+    private fun openYoutube(link: YtLink) {
+        if (released) return
+        if (isLocked) setLocked(false)
+        loadYoutube(link.id, link.startMs, link.vertical)
+        flash(if (cues.isEmpty()) "▶ YouTube ভিডিও খোলা হচ্ছে… এখন বাংলা SRT বেছে নিন" else "▶ YouTube ভিডিও খোলা হচ্ছে…")
+    }
+
+    // ---------- YouTube প্লেয়ার চালু ও বন্ধ ----------
+
+    private val ytHtmlTemplate: String by lazy {
+        try {
+            assets.open("yt.html").bufferedReader(Charsets.UTF_8).use { it.readText() }
+        } catch (e: Exception) {
+            ""
+        }
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun loadYoutube(id: String, startMs: Long, vertical: Boolean) {
+        val html = ytHtmlTemplate
+        if (html.isEmpty()) {
+            flash("YouTube প্লেয়ার খোলা যায়নি।")
+            return
+        }
+        finishSpeaking()
+        if (::player.isInitialized) {
+            try {
+                player.playWhenReady = false
+                player.stop()
+                player.clearMediaItems()
+            } catch (e: Exception) {
+            }
+        }
+        destroyYtView()
+        ytMode = true
+        ytGen++
+        val gen = ytGen
+        val now = SystemClock.uptimeMillis()
+        ytId = id
+        ytVertical = vertical
+        ytReady = false
+        ytState = -1
+        ytTime = startMs
+        ytTimeAt = now
+        ytMono = startMs
+        ytRate = 1f
+        ytDuration = 0L
+        ytWantPlay = false
+        ytPendingPlay = false
+        ytPendingSeek = -1L
+        ytPlaying = false
+        ytEnded = false
+        ytForeign = false
+        ytAppliedVol = -1
+        ytErrorShown = false
+        ytSeekTarget = startMs
+        ytSeekGuardUntil = now + 4000L
+        fadePos = 1f
+        videoW = if (vertical) 9 else 16
+        videoH = if (vertical) 16 else 9
+        surfaceView.visibility = View.GONE
+        emptyHint.visibility = View.GONE
+
+        val wv = WebView(this)
+        wv.setBackgroundColor(Color.BLACK)
+        val s = wv.settings
+        s.javaScriptEnabled = true
+        s.domStorageEnabled = true
+        s.mediaPlaybackRequiresUserGesture = false
+        s.cacheMode = WebSettings.LOAD_DEFAULT
+        wv.addJavascriptInterface(YtBridge(gen), "BVP")
+        wv.webViewClient = object : WebViewClient() {
+            // YouTube লোগো বা "YouTube-এ দেখুন" চাপলে সেটা YouTube অ্যাপে খুলবে, আমাদের প্লেয়ার বদলাবে না
+            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                val r = request ?: return false
+                if (!r.isForMainFrame) return false
+                val u = r.url?.toString() ?: return false
+                if (u.startsWith(YT_BASE_URL)) return false
+                openExternal(r.url)
+                return true
+            }
+        }
+        wv.webChromeClient = object : WebChromeClient() {
+            override fun getDefaultVideoPoster(): Bitmap? {
+                return Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888)
+            }
+        }
+        val lp = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        lp.gravity = Gravity.TOP
+        videoBox.addView(wv, 1, lp)
+        ytView = wv
+        wv.resumeTimers()
+        val page = html.replace("__VIDEO_ID__", id).replace("__START__", (startMs / 1000L).toString())
+        // ঠিকানাটা অ্যাপের নিজের পরিচয় (com.banglavoice.player), YouTube-এর নিয়ম অনুযায়ী
+        wv.loadDataWithBaseURL(YT_BASE_URL, page, "text/html", "utf-8", null)
+
+        currentVideoBase = id.lowercase(Locale.US)
+        videoName.text = "▶ YouTube: " + id
+        fetchYtTitle(id, gen)
+        registerNoisy()
+        applyYtStripLayout()
+        updatePlayButtons(false)
+        resetSpeech(startMs)
+        refreshLockBtn()
+        handler.postDelayed({
+            if (gen == ytGen && ytMode && !ytReady) onYtError(-1)
+        }, 25000L)
+        handler.post { applyLayout() }
+    }
+
+    private fun destroyYtView() {
+        val v = ytView ?: return
+        ytView = null
+        ytReady = false
+        handler.removeCallbacks(pauseTimersRunnable)
+        try {
+            v.evaluateJavascript("try { ytPause(); } catch (e) {}", null)
+        } catch (e: Exception) {
+        }
+        try {
+            videoBox.removeView(v)
+        } catch (e: Exception) {
+        }
+        try {
+            v.stopLoading()
+            v.removeJavascriptInterface("BVP")
+            v.destroy()
+        } catch (e: Exception) {
+        }
+    }
+
+    // ফোনের ভিডিও বাছলে YouTube বন্ধ করে আগের মতো
+    private fun exitYtMode() {
+        if (!ytMode) return
+        finishSpeaking()
+        ytMode = false
+        ytGen++
+        destroyYtView()
+        ytAbandonFocus()
+        unregisterNoisy()
+        ytId = ""
+        ytState = -1
+        ytWantPlay = false
+        ytPendingPlay = false
+        ytPlaying = false
+        ytEnded = false
+        ytForeign = false
+        ytPlans.clear()
+        // YouTube-এর জন্য তৈরি কণ্ঠ (০.৮৫x-১.৮x) ফোনের ভিডিওতে চলবে না, নতুন করে তৈরি হবে
+        prepGen++
+        cache.clear()
+        surfaceView.visibility = View.VISIBLE
+        videoW = 0
+        videoH = 0
+        applyLocalStripLayout()
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        updatePlayButtons(false)
+        handler.post { applyLayout() }
+    }
+
+    private fun openExternal(uri: Uri?) {
+        if (uri == null) return
+        try {
+            val i = if (uri.scheme == "intent") {
+                val p = Intent.parseUri(uri.toString(), Intent.URI_INTENT_SCHEME)
+                p.component = null
+                p.selector = null
+                p.addCategory(Intent.CATEGORY_BROWSABLE)
+                p
+            } else {
+                Intent(Intent.ACTION_VIEW, uri)
+            }
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            startActivity(i)
+        } catch (e: Exception) {
+            flash("লিংকটা খোলা যায়নি।")
+        }
+    }
+
+    // ভিডিওর নাম (শুধু দেখানোর জন্য আর SRT মেলানোর জন্য)
+    private fun fetchYtTitle(id: String, gen: Int) {
+        Thread {
+            var title = ""
+            try {
+                val target = URLEncoder.encode("https://www.youtube.com/watch?v=" + id, "UTF-8")
+                val c = URL("https://www.youtube.com/oembed?format=json&url=" + target).openConnection() as HttpURLConnection
+                c.connectTimeout = 8000
+                c.readTimeout = 8000
+                try {
+                    if (c.responseCode == 200) {
+                        val body = c.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+                        title = JSONObject(body).optString("title", "")
+                    }
+                } finally {
+                    c.disconnect()
+                }
+            } catch (e: Exception) {
+            }
+            val t = title.trim()
+            if (t.isNotEmpty()) {
+                runOnUiThread {
+                    if (gen == ytGen && ytMode) {
+                        videoName.text = "▶ YouTube: " + t
+                        currentVideoBase = t.lowercase(Locale.US)
+                    }
+                }
+            }
+        }.start()
+    }
+
+    // ---------- YouTube প্লেয়ারের খবর (পাতা থেকে অ্যাপে) ----------
+
+    inner class YtBridge(private val gen: Int) {
+        @JavascriptInterface
+        fun onReady() {
+            handler.post { if (gen == ytGen) onYtReady() }
+        }
+
+        @JavascriptInterface
+        fun onState(s: Int) {
+            handler.post { if (gen == ytGen) onYtStateEvent(s) }
+        }
+
+        @JavascriptInterface
+        fun onError(code: Int) {
+            handler.post { if (gen == ytGen) onYtError(code) }
+        }
+
+        @JavascriptInterface
+        fun onApiFail() {
+            handler.post { if (gen == ytGen) onYtError(-1) }
+        }
+
+        @JavascriptInterface
+        fun onTime(t: Double, d: Double, s: Int, r: Double) {
+            handler.post { if (gen == ytGen) onYtTime(t, d, s, r) }
+        }
+
+        @JavascriptInterface
+        fun onUrl(u: String?) {
+            val x = u ?: return
+            handler.post { if (gen == ytGen) onYtUrl(x) }
+        }
+    }
+
+    private fun ytJs(code: String) {
+        val v = ytView ?: return
+        try {
+            v.evaluateJavascript(code, null)
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun onYtReady() {
+        if (!ytMode) return
+        ytReady = true
+        ytAppliedVol = -1
+        applyVolumeNow()
+        if (ytPendingSeek >= 0L) {
+            val t = ytPendingSeek
+            ytPendingSeek = -1L
+            ytJs("ytSeek(" + t + ")")
+        }
+        if (ytPendingPlay) {
+            ytPendingPlay = false
+            ytJs("ytPlay()")
+        }
+        updateTimeUi(curPos())
+    }
+
+    private fun onYtStateEvent(s: Int) {
+        if (!ytMode) return
+        if (s == -2) {
+            // ফোন নিজে থেকে চালু হতে দেয়নি
+            ytWantPlay = false
+            ytPendingPlay = false
+            updatePlayButtons(false)
+            flash("▶ ভিডিওর উপর একবার ট্যাপ করে চালু করুন")
+            return
+        }
+        applyYtState(s, SystemClock.uptimeMillis())
+    }
+
+    // YouTube-এর অবস্থা: -১ শুরু হয়নি, ০ শেষ, ১ চলছে, ২ থেমে আছে, ৩ লোড হচ্ছে, ৫ প্রস্তুত
+    private fun applyYtState(s: Int, now: Long) {
+        if (s != ytState) {
+            ytState = s
+            when (s) {
+                1 -> {
+                    ytWantPlay = true
+                    ytEnded = false
+                }
+                2 -> ytWantPlay = false
+                0 -> {
+                    ytWantPlay = false
+                    ytEnded = true
+                    finishSpeaking()
+                }
+            }
+            updatePlayButtons(ytWantPlay)
+            if (ytWantPlay) {
+                window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            } else {
+                window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            }
+        }
+        ytCheckPlaying(now)
+    }
+
+    // ভিডিওর সময় সত্যিই এগোচ্ছে কিনা (বিজ্ঞাপন বা লোড হওয়ার সময় এগোয় না, তখন বাংলা পড়াও থেমে থাকে)
+    private fun ytCheckPlaying(now: Long) {
+        val playing = ytMode && ytState == 1 && now - ytTimeAt < YT_STALL_MS
+        if (playing != ytPlaying) {
+            ytPlaying = playing
+            // থেমে গেলে আন্দাজ করা বাড়তি সময়টুকু বাদ, যাতে বিজ্ঞাপনের পর কণ্ঠ আগে শুরু না হয়
+            if (!playing) ytMono = ytTime
+            onPlayingChanged(playing)
+        }
+    }
+
+    private fun onYtTime(tMs: Double, dMs: Double, s: Int, r: Double) {
+        if (!ytMode) return
+        val now = SystemClock.uptimeMillis()
+        if (dMs > 0.0) ytDuration = dMs.toLong()
+        if (r > 0.0) ytRate = r.toFloat().coerceIn(0.25f, 2f)
+        val t = max(0L, tMs.toLong())
+        if (t != ytTime) {
+            if (now < ytSeekGuardUntil && ytSeekTarget >= 0L) {
+                // লাফ দেওয়ার পর YouTube কিছুক্ষণ পুরনো সময় জানাতে পারে, সেটা বাদ
+                if (abs(t - ytSeekTarget) > 1500L) {
+                    applyYtState(s, now)
+                    return
+                }
+                ytSeekGuardUntil = 0L
+            } else if (abs(t - ytPos()) > 1500L) {
+                // YouTube-এর নিজের দাগ টেনে সামনে-পেছনে গেলে বাংলা পড়া নতুন জায়গা থেকে
+                ytTime = t
+                ytTimeAt = now
+                ytMono = t
+                applyYtState(s, now)
+                resetSpeech(t)
+                return
+            }
+            ytTime = t
+            ytTimeAt = now
+            if (t < ytMono - 2000L) ytMono = t
+        }
+        applyYtState(s, now)
+    }
+
+    // শেষ জানা সময় থেকে এখনকার সময় আন্দাজ (YouTube প্রতি মুহূর্তে সময় জানায় না)
+    private fun ytPos(): Long {
+        val now = SystemClock.uptimeMillis()
+        var p = ytTime
+        if (ytState == 1 && now - ytTimeAt < YT_STALL_MS) {
+            p += min(YT_GUESS_MS, ((now - ytTimeAt) * ytRate).toLong())
+        }
+        if (p > ytMono) ytMono = p
+        return ytMono
+    }
+
+    // ভিডিও শেষে YouTube অন্য ভিডিও চালালে, সেটার সাথে আপনার SRT মিলবে না
+    private fun onYtUrl(u: String) {
+        if (!ytMode || !ytReady) return
+        val link = parseYtLink(u) ?: return
+        val foreign = link.id != ytId
+        if (foreign == ytForeign) return
+        ytForeign = foreign
+        if (foreign) {
+            finishSpeaking()
+            flash("⚠ YouTube অন্য ভিডিও চালাচ্ছে, আপনার SRT মিলবে না, তাই বাংলা পড়া বন্ধ")
+        } else {
+            resetSpeech(curPos())
+        }
+    }
+
+    private fun onYtError(code: Int) {
+        if (!ytMode || ytErrorShown || released || isFinishing) return
+        ytErrorShown = true
+        ytWantPlay = false
+        ytPendingPlay = false
+        updatePlayButtons(false)
+        val msg = when (code) {
+            -1 -> "YouTube লোড করা যায়নি। ইন্টারনেট চালু আছে কিনা দেখে আবার লিংক দিন।"
+            2 -> "লিংকটা ঠিক নয়, ভিডিওটা খুঁজে পাওয়া যায়নি।"
+            5 -> "এই ফোনে ভিডিওটা চালাতে সমস্যা হচ্ছে। আবার চেষ্টা করুন।"
+            100 -> "ভিডিওটা পাওয়া যায়নি। হয়তো মুছে ফেলা হয়েছে বা প্রাইভেট করা আছে।"
+            101, 150 -> "এই ভিডিওর মালিক অন্য অ্যাপে চালানো বন্ধ রেখেছেন, তাই এখানে চলবে না।"
+            153 -> "YouTube অ্যাপের পরিচয় নিতে পারেনি (কোড ১৫৩)। আবার লিংক দিয়ে চেষ্টা করুন।"
+            else -> "YouTube ভিডিওটা চালাতে পারছে না (কোড " + bn(code.toString()) + ")। বয়সসীমা দেওয়া ভিডিও এখানে চলে না।"
+        }
+        try {
+            AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+                .setTitle("▶ YouTube")
+                .setMessage(msg)
+                .setPositiveButton("ঠিক আছে", null)
+                .show()
+        } catch (e: Exception) {
+            flash(msg)
+        }
+    }
+
+    // ---------- চালানো, থামানো, লাফ, আওয়াজ ----------
+
+    private fun ytPlay() {
+        ytWantPlay = true
+        updatePlayButtons(true)
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        ytRequestFocus()
+        if (!ytReady) {
+            ytPendingPlay = true
+            return
+        }
+        ytJs("ytPlay()")
+    }
+
+    private fun ytPause() {
+        ytWantPlay = false
+        ytPendingPlay = false
+        updatePlayButtons(false)
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        ytJs("ytPause()")
+    }
+
+    private fun ytSeekTo(t: Long) {
+        val now = SystemClock.uptimeMillis()
+        ytTime = t
+        ytTimeAt = now
+        ytMono = t
+        ytSeekTarget = t
+        ytSeekGuardUntil = now + 3000L
+        ytEnded = false
+        if (!ytReady) {
+            ytPendingSeek = t
+            return
+        }
+        ytJs("ytSeek(" + t + ")")
+    }
+
+    // আওয়াজ ০ থেকে ১০০ (YouTube প্লেয়ারের নিজের মাপ)
+    private fun setYtVolume(g: Float) {
+        if (!ytReady) return
+        val v = (g * 100f).roundToInt().coerceIn(0, 100)
+        if (v == ytAppliedVol) return
+        ytAppliedVol = v
+        ytJs("ytVol(" + v + ")")
+    }
+
+    // ---------- ফোন এলে বা অন্য অ্যাপ আওয়াজ চালালে YouTube ভিডিও থামা ----------
+
+    private val ytFocusListener = AudioManager.OnAudioFocusChangeListener { change ->
+        handler.post { onYtFocusChange(change) }
+    }
+
+    // শুধু আমাদের ▶ বোতাম চাপলে, ভিডিও চালু হওয়ার আগেই চাওয়া হয়
+    private fun ytRequestFocus() {
+        if (ytHasFocus || ytFocusByWeb) return
+        ytFocusAskedAt = SystemClock.uptimeMillis()
+        try {
+            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            val r = if (Build.VERSION.SDK_INT >= 26) {
+                val attrs = AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
+                    .build()
+                val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                    .setAudioAttributes(attrs)
+                    .setOnAudioFocusChangeListener(ytFocusListener, handler)
+                    .build()
+                ytFocusReq = req
+                am.requestAudioFocus(req)
+            } else {
+                @Suppress("DEPRECATION")
+                am.requestAudioFocus(ytFocusListener, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN)
+            }
+            ytHasFocus = r == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun ytAbandonFocus() {
+        if (!ytHasFocus) return
+        ytHasFocus = false
+        try {
+            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            val req = ytFocusReq
+            if (Build.VERSION.SDK_INT >= 26 && req is AudioFocusRequest) {
+                am.abandonAudioFocusRequest(req)
+            } else {
+                @Suppress("DEPRECATION")
+                am.abandonAudioFocus(ytFocusListener)
+            }
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun onYtFocusChange(change: Int) {
+        if (change == AudioManager.AUDIOFOCUS_GAIN) return
+        if (change != AudioManager.AUDIOFOCUS_LOSS && change != AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) return
+        ytHasFocus = false
+        // চালু হওয়ার ঠিক পরেই ফোকাস চলে গেলে বুঝতে হবে YouTube প্লেয়ার নিজেই এটা সামলায়, তখন আর চাওয়া হবে না
+        if (SystemClock.uptimeMillis() - ytFocusAskedAt < 3000L) {
+            ytFocusByWeb = true
+            return
+        }
+        if (ytMode && ytWantPlay) {
+            ytPause()
+            flash("⏸ অন্য আওয়াজ শুরু হয়েছে, তাই ভিডিও থামানো হলো")
+        }
+    }
+
+    private val noisyReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            // হেডফোন খুলে ফেললে YouTube ভিডিও থামবে, হঠাৎ জোরে স্পিকারে বাজবে না
+            if (intent?.action == AudioManager.ACTION_AUDIO_BECOMING_NOISY && ytMode && ytWantPlay) ytPause()
+        }
+    }
+
+    private fun registerNoisy() {
+        if (noisyRegistered) return
+        try {
+            registerReceiver(noisyReceiver, IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY))
+            noisyRegistered = true
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun unregisterNoisy() {
+        if (!noisyRegistered) return
+        noisyRegistered = false
+        try {
+            unregisterReceiver(noisyReceiver)
+        } catch (e: Exception) {
+        }
+    }
+
+    // ---------- ভিডিওর নিচের কালো পট্টি (লেখা আর বোতাম, YouTube-এর ছবির উপরে কিছু থাকে না) ----------
+
+    private fun ytStripPx(): Int = dp(if (isFullscreen) 72f else 84f).toInt()
+
+    private fun fitYt() {
+        val v = ytView ?: return
+        val bh = videoBox.height
+        if (bh <= 0) return
+        val h = max(dp(150f).toInt(), bh - ytStripPx())
+        val lp = v.layoutParams as FrameLayout.LayoutParams
+        if (lp.width != ViewGroup.LayoutParams.MATCH_PARENT || lp.height != h || lp.gravity != Gravity.TOP) {
+            lp.width = ViewGroup.LayoutParams.MATCH_PARENT
+            lp.height = h
+            lp.gravity = Gravity.TOP
+            v.layoutParams = lp
+        }
+    }
+
+    private fun applyYtStripLayout() {
+        val strip = ytStripPx()
+        val btn = dp(44f).toInt()
+        val m = dp(4f).toInt()
+        val left = dp(56f).toInt()
+        val right = dp(if (isFullscreen) 108f else 56f).toInt()
+        val slp = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, strip - 2 * m)
+        slp.gravity = Gravity.BOTTOM
+        slp.setMargins(left, m, right, m)
+        subtitleView.layoutParams = slp
+        subtitleView.translationY = 0f
+        subtitleView.background = null
+        subtitleView.setPadding(dp(4f).toInt(), 0, dp(4f).toInt(), 0)
+        if (Build.VERSION.SDK_INT >= 26) {
+            // লেখা লম্বা হলে নিজে থেকে একটু ছোট হয়ে পট্টির ভেতরেই থাকবে
+            subtitleView.setAutoSizeTextTypeUniformWithConfiguration(11, if (isFullscreen) 20 else 17, 1, TypedValue.COMPLEX_UNIT_SP)
+        } else {
+            subtitleView.textSize = if (isFullscreen) 17f else 15f
+            subtitleView.maxLines = 3
+        }
+        val llp = FrameLayout.LayoutParams(btn, btn)
+        llp.gravity = Gravity.BOTTOM or Gravity.START
+        llp.setMargins(dp(6f).toInt(), 0, 0, (strip - btn) / 2)
+        lockBtn.layoutParams = llp
+        lockBtn.background = rounded(0x33FFFFFF, 22f)
+        val blp = ytBtns.layoutParams as FrameLayout.LayoutParams
+        blp.gravity = Gravity.BOTTOM or Gravity.END
+        blp.setMargins(0, 0, dp(6f).toInt(), (strip - btn) / 2)
+        ytBtns.layoutParams = blp
+        ytBtns.visibility = if (isLocked) View.GONE else View.VISIBLE
+        ytMuteBtn.visibility = if (isFullscreen) View.VISIBLE else View.GONE
+        ytFullBtn.text = if (isFullscreen) "✕" else "📺"
+        fsBar.visibility = View.GONE
+        exitFull.visibility = View.GONE
+        lastShownIdx = -2
+        fitYt()
+    }
+
+    // ফোনের ভিডিওর জন্য লেখা আর বোতাম আগের জায়গায় ফেরানো
+    private fun applyLocalStripLayout() {
+        val slp = FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        slp.gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+        val m = dp(14f).toInt()
+        slp.setMargins(m, 0, m, m)
+        subtitleView.layoutParams = slp
+        if (Build.VERSION.SDK_INT >= 26) subtitleView.setAutoSizeTextTypeWithDefaults(TextView.AUTO_SIZE_TEXT_TYPE_NONE)
+        subtitleView.maxLines = Int.MAX_VALUE
+        subtitleView.textSize = if (isFullscreen) 22f else 18f
+        subtitleView.background = rounded(0xB3000000.toInt(), 10f)
+        subtitleView.setPadding(dp(12f).toInt(), dp(6f).toInt(), dp(12f).toInt(), dp(6f).toInt())
+        val btn = dp(44f).toInt()
+        val llp = FrameLayout.LayoutParams(btn, btn)
+        llp.gravity = Gravity.TOP or Gravity.START
+        val lm = dp(12f).toInt()
+        llp.setMargins(lm, lm, lm, lm)
+        lockBtn.layoutParams = llp
+        lockBtn.background = rounded(0x80000000.toInt(), 22f)
+        ytBtns.visibility = View.GONE
+        lastShownIdx = -2
+    }
+
+    // YouTube: কণ্ঠ আসলে কখন শুরু হলো, সেই অনুযায়ী সামনের বাক্যগুলোর হিসাব ঠিক রাখা
+    private fun ytAfterStart(idx: Int, clip: Clip) {
+        val actual = curPos()
+        val planned = ytPlans[idx]
+        val dur = (clip.durMs * ytRate).toLong()
+        if (planned != null && planned.gen == prepGen && actual - planned.start > 400L) {
+            // পরিকল্পনার চেয়ে দেরিতে শুরু হলো: সামনের বাক্যগুলোর গতি নতুন করে হিসাব
+            prepGen++
+            val ks = ArrayList(cache.keys)
+            for (k in ks) if (k > idx) cache.remove(k)
+            ytPlans.clear()
+        }
+        ytPlans[idx] = YtPlan(prepGen, actual, actual + dur)
+    }
+
+    // YouTube: ভিডিওর গতি কখনো বদলায় না, তাই শুধু কণ্ঠের গতি দিয়ে মেলানো (০.৮৫x থেকে ১.৮x)
+    // আগের বাক্য কখন শেষ হবে জানা থাকে, তাই এই বাক্যের হাতে ঠিক কত সময় আছে তা আগেই হিসাব করা যায়
+    private fun fitYtClip(i: Int, gen: Int, unit: SpeechUnit, first: Clip?, list: List<SpeechUnit>): Clip? {
+        val rate = ytRate
+        var start = max(unit.startMs - LEAD_MS, planFloor)
+        val prev = ytPlans[i - 1]
+        if (prev != null && prev.gen == gen) start = max(start, prev.end + (YT_MIN_PAUSE_MS * rate).toLong())
+        var clip = first
+        val next = list.getOrNull(i + 1)
+        if (clip != null && clip.ok) {
+            val d1 = clip.durMs.toFloat()
+            // কথার জন্য হাতে থাকা আসল সময় (পরের বাক্যের আগে বিরতিটুকু বাদ দিয়ে)
+            val avail = if (next != null) {
+                ((next.startMs - LEAD_MS - start).toFloat() / rate).toLong() - unit.pauseMs
+            } else {
+                Long.MAX_VALUE / 4L
+            }
+            // এই লাইনটা নিজে স্ক্রিনে কতক্ষণ থাকে (মোটামুটি মূল কথা কতক্ষণ চলে)
+            val span = (unit.lastEndMs - start).toFloat() / rate
+            val want = if (avail <= 200L) {
+                YT_VOICE_MAX
+            } else {
+                val need = d1 / avail.toFloat()
+                if (need > 1.03f) {
+                    min(YT_VOICE_MAX, need)
+                } else if (span > 300f) {
+                    // বাংলা কথা মূল কথার চেয়ে অনেক ছোট হলে একটু ধীরে, শান্তভাবে (তবু পরের লাইনের আগেই শেষ হবে)
+                    min(1f, max(YT_VOICE_MIN, max(need, d1 / (0.9f * span))))
+                } else {
+                    1f
+                }
+            }
+            if (abs(want - 1f) > 0.03f) {
+                var c = synth(unit.text, BASE_RATE * want)
+                // কণ্ঠের গতি বাড়ালেও সময় ঠিক সেই অনুপাতে কমে না, তাই দরকার হলে আরেকবার মিলিয়ে নেওয়া
+                if (c != null && c.ok && want > 1f && want < YT_VOICE_MAX && avail > 200L && c.durMs > avail + 120L) {
+                    val again = min(YT_VOICE_MAX, want * c.durMs.toFloat() / avail.toFloat())
+                    if (again > want + 0.03f) {
+                        val c2 = synth(unit.text, BASE_RATE * again)
+                        if (c2 != null && c2.ok) c = c2
+                    }
+                }
+                if (c != null && c.ok) clip = c
+            }
+        }
+        val dur = if (clip != null && clip.ok) (clip.durMs * rate).toLong() else 0L
+        if (gen == prepGen) ytPlans[i] = YtPlan(gen, start, start + dur)
+        return clip
     }
 
     // ================= জীবনচক্র =================
@@ -2470,6 +3519,12 @@ class MainActivity : Activity() {
     override fun onStart() {
         super.onStart()
         if (!released) {
+            handler.removeCallbacks(pauseTimersRunnable)
+            val yv = ytView
+            if (yv != null) {
+                yv.resumeTimers()
+                yv.onResume()
+            }
             handler.removeCallbacks(tickRunnable)
             handler.post(tickRunnable)
         }
@@ -2479,6 +3534,12 @@ class MainActivity : Activity() {
     override fun onStop() {
         super.onStop()
         if (::player.isInitialized && !released) player.pause()
+        if (ytMode && !released) {
+            // হোম চাপলে বা অন্য অ্যাপে গেলে YouTube ভিডিওও থামবে, পেছনে কিছু চলবে না
+            ytPause()
+            ytView?.onPause()
+            handler.postDelayed(pauseTimersRunnable, 600L)
+        }
         handler.removeCallbacks(tickRunnable)
     }
 
