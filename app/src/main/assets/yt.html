@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<style>
+html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: #000; overflow: hidden; }
+#p { position: absolute; left: 0; top: 0; width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<div id="p"></div>
+<script>
+// বাংলা ভয়েস প্লেয়ার: YouTube-এর নিজের প্লেয়ার (অফিসিয়াল IFrame API)
+// অ্যাপ এখান থেকে শুধু চালানো, থামানো, লাফ দেওয়া আর আওয়াজ কম-বেশি করে
+// ভিডিওর গতি কখনো বদলানো হয় না
+var VID = '__VIDEO_ID__';
+var START = __START__;
+var player = null;
+var timer = null;
+var lastUrlCheck = 0;
+
+function bridge() {
+  return window.BVP || null;
+}
+
+// প্রতি ৫০ মিলিসেকেন্ডে অ্যাপকে ভিডিওর সময় আর অবস্থা জানানো
+function report() {
+  if (!player || !player.getCurrentTime) return;
+  var t = 0, d = 0, s = -1, r = 1;
+  try { t = player.getCurrentTime() || 0; } catch (e) {}
+  try { d = player.getDuration() || 0; } catch (e) {}
+  try { s = player.getPlayerState(); } catch (e) {}
+  try { r = player.getPlaybackRate() || 1; } catch (e) {}
+  var b = bridge();
+  if (b) b.onTime(Math.round(t * 1000), Math.round(d * 1000), s, r);
+  var now = Date.now();
+  if (now - lastUrlCheck > 1000) {
+    lastUrlCheck = now;
+    var u = '';
+    try { u = player.getVideoUrl() || ''; } catch (e) {}
+    if (u && b) b.onUrl(u);
+  }
+}
+
+function onYouTubeIframeAPIReady() {
+  player = new YT.Player('p', {
+    width: '100%',
+    height: '100%',
+    videoId: VID,
+    playerVars: {
+      controls: 1,
+      fs: 0,
+      rel: 0,
+      playsinline: 1,
+      iv_load_policy: 3,
+      start: START,
+      enablejsapi: 1,
+      origin: 'https://com.banglavoice.player'
+    },
+    events: {
+      onReady: function () {
+        try { player.unMute(); } catch (e) {}
+        var b = bridge();
+        if (b) b.onReady();
+        if (!timer) timer = setInterval(report, 50);
+        report();
+      },
+      onStateChange: function (e) {
+        var b = bridge();
+        if (b) b.onState(e.data);
+        report();
+      },
+      onError: function (e) {
+        var b = bridge();
+        if (b) b.onError(e.data);
+      },
+      onAutoplayBlocked: function () {
+        var b = bridge();
+        if (b) b.onState(-2);
+      }
+    }
+  });
+}
+
+function ytPlay() {
+  if (player && player.playVideo) player.playVideo();
+}
+
+function ytPause() {
+  if (player && player.pauseVideo) player.pauseVideo();
+}
+
+// ভিডিও এখনো শুরু না হলে লাফ দিলে নিজে থেকে চালু হয়ে যায়, তাই তখন শুধু শুরুর জায়গা বদলানো হয়
+function ytSeek(ms) {
+  if (!player || !player.seekTo) return;
+  var s = -1;
+  try { s = player.getPlayerState(); } catch (e) {}
+  if (s === -1 || s === 5) {
+    player.cueVideoById({ videoId: VID, startSeconds: ms / 1000 });
+  } else {
+    player.seekTo(ms / 1000, true);
+  }
+}
+
+function ytVol(v) {
+  if (!player || !player.setVolume) return;
+  player.setVolume(v);
+  try {
+    if (v > 0 && player.isMuted && player.isMuted()) player.unMute();
+  } catch (e) {}
+}
+</script>
+<script src="https://www.youtube.com/iframe_api" onerror="var b = bridge(); if (b) b.onApiFail();"></script>
+</body>
+</html>
