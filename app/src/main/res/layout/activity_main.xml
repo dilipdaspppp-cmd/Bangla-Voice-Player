@@ -212,6 +212,34 @@
             android:textColor="@color/white"
             android:textSize="18sp"
             android:visibility="gone" />
+
+        <LinearLayout
+            android:id="@+id/ytBtns"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="bottom|end"
+            android:orientation="horizontal"
+            android:visibility="gone">
+
+            <TextView
+                android:id="@+id/ytMute"
+                android:layout_width="44dp"
+                android:layout_height="44dp"
+                android:layout_marginRight="8dp"
+                android:gravity="center"
+                android:text="🔊"
+                android:textColor="@color/white"
+                android:textSize="18sp" />
+
+            <TextView
+                android:id="@+id/ytFull"
+                android:layout_width="44dp"
+                android:layout_height="44dp"
+                android:gravity="center"
+                android:text="📺"
+                android:textColor="@color/white"
+                android:textSize="18sp" />
+        </LinearLayout>
     </FrameLayout>
 
     <ScrollView
@@ -338,6 +366,13 @@
                         android:text="📄 SRT বাছুন" />
                 </LinearLayout>
 
+                <Button
+                    android:id="@+id/btnYt"
+                    android:layout_width="match_parent"
+                    android:layout_height="48dp"
+                    android:layout_marginTop="8dp"
+                    android:text="▶ YouTube লিংক দিয়ে চালান" />
+
                 <TextView
                     android:id="@+id/videoName"
                     android:layout_width="match_parent"
@@ -416,7 +451,7 @@
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:layout_marginTop="12dp"
-                    android:text="⚖ কণ্ঠের গতি আর ভিডিওর গতি অ্যাপ নিজেই মিলিয়ে নেয়। প্রতিটি বাক্যের পর হালকা বিরতি থাকে।"
+                    android:text="⚖ কণ্ঠের গতি আর ভিডিওর গতি অ্যাপ নিজেই মিলিয়ে নেয়। প্রতিটি বাক্যের পর হালকা বিরতি থাকে। YouTube ভিডিও সবসময় স্বাভাবিক গতিতে চলে, শুধু কণ্ঠের গতি বদলায় (০.৮৫x থেকে ১.৮x)।"
                     android:textColor="@color/textDim"
                     android:textSize="13sp" />
 
@@ -477,7 +512,7 @@
                 android:layout_height="wrap_content"
                 android:layout_marginTop="10dp"
                 android:gravity="center"
-                android:text="ভিডিওতে এক ট্যাপ = চালান/থামান (ফুলস্ক্রিনে কন্ট্রোল দেখান/লুকান) · দুই ট্যাপ = ফুলস্ক্রিন · ডানে সোয়াইপ = পরের লাইন · বামে সোয়াইপ = আগের লাইন · 🔓 = স্ক্রিন লক (খুলতে স্ক্রিনে ট্যাপ করে 🔒 চাপুন)"
+                android:text="ভিডিওতে এক ট্যাপ = চালান/থামান (ফুলস্ক্রিনে কন্ট্রোল দেখান/লুকান) · দুই ট্যাপ = ফুলস্ক্রিন · ডানে সোয়াইপ = পরের লাইন · বামে সোয়াইপ = আগের লাইন · 🔓 = স্ক্রিন লক (খুলতে স্ক্রিনে ট্যাপ করে 🔒 চাপুন) · YouTube ভিডিওতে এই ট্যাপ আর সোয়াইপ করবেন ভিডিওর নিচের লেখার জায়গায়"
                 android:textColor="@color/textDim"
                 android:textSize="12sp" />
         </LinearLayout>
