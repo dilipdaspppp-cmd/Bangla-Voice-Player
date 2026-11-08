@@ -21,7 +21,9 @@ import android.webkit.WebViewClient
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
+import org.json.JSONArray
 import org.json.JSONObject
+import android.widget.Toast
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Environment
@@ -149,6 +151,9 @@ class DirNode(val dir: File, val depth: Int)
 // YouTube লিংক থেকে পাওয়া তথ্য
 class YtLink(val id: String, val startMs: Long, val vertical: Boolean)
 
+// আগে দেখা YouTube ভিডিও
+class YtHist(val id: String, var title: String, var at: Long, val vertical: Boolean)
+
 // YouTube ভিডিওতে কোন বাক্যের কণ্ঠ কখন শুরু ও শেষ হবে তার হিসাব (ভিডিওর সময়ে)
 class YtPlan(val gen: Int, val start: Long, val end: Long)
 
@@ -205,6 +210,7 @@ class MainActivity : Activity() {
         const val YT_STALL_MS = 1200L    // এতক্ষণ YouTube-এর সময় না এগোলে ধরা হবে বিজ্ঞাপন বা লোড হচ্ছে
         const val YT_GUESS_MS = 700L     // YouTube দুবার সময় জানানোর মাঝে সর্বোচ্চ এতটুকু সময় নিজে আন্দাজ করা হয়
         const val YT_BASE_URL = "https://com.banglavoice.player/"
+        const val YT_HISTORY_MAX = 100   // আগে দেখা ভিডিওর তালিকায় সর্বোচ্চ কয়টা থাকবে
         const val JOIN_GAP_MS = 600L     // দুই লাইনের ফাঁক এর কম হলে একই বাক্য ধরা হবে
         const val MAX_JOIN_CUES = 3      // এক বাক্যে সর্বোচ্চ কয়টি লাইন
         const val MAX_JOIN_CHARS = 200   // এক বাক্যে সর্বোচ্চ কত অক্ষর
@@ -294,6 +300,7 @@ class MainActivity : Activity() {
     private var ytFocusReq: Any? = null
     private var noisyRegistered = false
     private var lockPass = false
+    private var ytFullSize = true                // ফুলস্ক্রিনে ফুল (লেখা ছাড়া) নাকি হাফ (নিচে লেখা)
     private val ytPlans = ConcurrentHashMap<Int, YtPlan>()
     @Volatile private var planFloor = 0L
 
@@ -341,6 +348,7 @@ class MainActivity : Activity() {
     private lateinit var btnYt: Button
     private lateinit var ytBtns: LinearLayout
     private lateinit var ytMuteBtn: TextView
+    private lateinit var ytSizeBtn: TextView
     private lateinit var ytFullBtn: TextView
 
     private val hideBarRunnable = Runnable {
@@ -386,6 +394,7 @@ class MainActivity : Activity() {
         muteSwitch.isChecked = muteOriginal
         fsMute.text = if (muteOriginal) "🔇" else "🔊"
         ytMuteBtn.text = fsMute.text
+        ytFullSize = prefs.getBoolean("ytFullSize", true)
         setupPlayer()
         setupControls()
         setupGestures()
@@ -445,6 +454,7 @@ class MainActivity : Activity() {
         btnYt = findViewById<Button>(R.id.btnYt)!!
         ytBtns = findViewById<LinearLayout>(R.id.ytBtns)!!
         ytMuteBtn = findViewById<TextView>(R.id.ytMute)!!
+        ytSizeBtn = findViewById<TextView>(R.id.ytSize)!!
         ytFullBtn = findViewById<TextView>(R.id.ytFull)!!
     }
 
@@ -489,6 +499,7 @@ class MainActivity : Activity() {
         exitFull.background = rounded(0x80000000.toInt(), 22f)
         lockBtn.background = rounded(0x80000000.toInt(), 22f)
         ytMuteBtn.background = rounded(0x33FFFFFF, 22f)
+        ytSizeBtn.background = rounded(0x33FFFFFF, 22f)
         ytFullBtn.background = rounded(0x33FFFFFF, 22f)
         voiceSpinner.backgroundTintList = ColorStateList.valueOf(Color.WHITE)
 
@@ -836,11 +847,22 @@ class MainActivity : Activity() {
     // ব্যাক চাপলে অ্যাপ বন্ধ করার অপশন
     private fun showExitDialog() {
         AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
-            .setTitle("🚪 অ্যাপ বন্ধ করবেন?")
-            .setMessage("অ্যাপ পুরোপুরি বন্ধ হয়ে যাবে, ব্যাকগ্রাউন্ডে কিছুই চলবে না। পরের বার খুললে নতুন করে ভিডিও আর সাবটাইটেল বেছে নিতে হবে।")
-            .setPositiveButton("বন্ধ করুন") { _, _ -> exitApp() }
+            .setTitle("🚪 অ্যাপ থেকে বের হবেন?")
+            .setMessage(
+                "🚪 পুরো বন্ধ: অ্যাপ পুরোপুরি বন্ধ হবে, পরের বার নতুন করে ভিডিও আর সাবটাইটেল বেছে নিতে হবে।" + NL + NL +
+                    "↩ সাধারণভাবে বেরোলে: অ্যাপ পেছনে থেমে থাকবে, কিছু চলবে না। আবার খুললে সাথে সাথে খুলবে, যেখানে ছিলেন সেখান থেকে।"
+            )
+            .setPositiveButton("🚪 পুরো বন্ধ") { _, _ -> exitApp() }
+            .setNeutralButton("↩ সাধারণভাবে বেরিয়ে যান") { _, _ -> softExit() }
             .setNegativeButton("না, থাকি", null)
             .show()
+    }
+
+    // অ্যাপ বন্ধ না করে পেছনে পাঠানো (হোম বোতামের মতো); ভিডিও থেমে থাকবে, পেছনে কিছু চলবে না
+    private fun softExit() {
+        if (::player.isInitialized && !released) player.pause()
+        if (ytMode) ytPause()
+        if (!moveTaskToBack(true)) exitApp()
     }
 
     private var released = false
@@ -1079,6 +1101,7 @@ class MainActivity : Activity() {
         btnFwd.setOnClickListener { seekToMs(curPos() + 10000L) }
         btnYt.setOnClickListener { showYtDialog() }
         ytMuteBtn.setOnClickListener { setMuteOriginal(!muteOriginal) }
+        ytSizeBtn.setOnClickListener { toggleYtSize() }
         ytFullBtn.setOnClickListener { toggleFullscreen() }
         btnFull.setOnClickListener { toggleFullscreen() }
         exitFull.setOnClickListener { toggleFullscreen() }
@@ -2396,7 +2419,8 @@ class MainActivity : Activity() {
         val idx = if (list.isEmpty()) -1 else findCueAt(list, pos)
         if (idx == lastShownIdx) return
         lastShownIdx = idx
-        if (idx < 0 || !showSubs) {
+        // YouTube "ফুল"-এ লেখা দেখায় না, শুধু কণ্ঠ
+        if (idx < 0 || !showSubs || ytFullNow()) {
             subtitleView.visibility = View.GONE
         } else {
             subtitleView.text = list[idx].display
@@ -2738,65 +2762,294 @@ class MainActivity : Activity() {
         }
     }
 
+    // ---------- YouTube লিংক আর আগে দেখা ভিডিওর পাতা ----------
+
     private fun showYtDialog() {
-        val pad = dp(22f).toInt()
+        val bg = getColor(R.color.bg)
+        val textC = getColor(R.color.text)
+        val dimC = getColor(R.color.textDim)
+        val surface2 = getColor(R.color.surface2)
+        val pad = dp(16f).toInt()
+        val wrap = ViewGroup.LayoutParams.WRAP_CONTENT
+        val match = ViewGroup.LayoutParams.MATCH_PARENT
+
+        val dlg = Dialog(this, android.R.style.Theme_Material_NoActionBar)
         val box = LinearLayout(this)
         box.orientation = LinearLayout.VERTICAL
-        box.setPadding(pad, dp(8f).toInt(), pad, 0)
+        box.setBackgroundColor(bg)
 
-        val info = TextView(this)
-        info.text = "YouTube ভিডিওর লিংক নিচে পেস্ট করুন। ভিডিও নামাতে হবে না, সরাসরি চলবে।" + NL + NL +
-            "আরও সহজ: YouTube অ্যাপে ভিডিওর নিচে “শেয়ার” চেপে “বাংলা ভয়েস প্লেয়ার” বাছুন।"
-        info.setTextColor(getColor(R.color.text))
-        info.textSize = 14f
+        // উপরের সারি: নাম আর ✕
+        val head = LinearLayout(this)
+        head.orientation = LinearLayout.HORIZONTAL
+        head.gravity = Gravity.CENTER_VERTICAL
+        head.setPadding(pad, pad, pad / 2, pad / 2)
+        val title = TextView(this)
+        title.text = "▶ YouTube ভিডিও"
+        title.setTextColor(textC)
+        title.textSize = 19f
+        title.setTypeface(title.typeface, android.graphics.Typeface.BOLD)
+        title.layoutParams = LinearLayout.LayoutParams(0, wrap, 1f)
+        val close = TextView(this)
+        close.text = "✕"
+        close.setTextColor(textC)
+        close.textSize = 22f
+        close.gravity = Gravity.CENTER
+        close.layoutParams = LinearLayout.LayoutParams(dp(48f).toInt(), dp(48f).toInt())
+        close.setOnClickListener { dlg.dismiss() }
+        head.addView(title)
+        head.addView(close)
 
+        // লিংক বসানোর ঘর আর পেস্ট বোতাম
+        val row = LinearLayout(this)
+        row.orientation = LinearLayout.HORIZONTAL
+        row.gravity = Gravity.CENTER_VERTICAL
+        row.setPadding(pad, 0, pad, 0)
         val input = EditText(this)
-        input.hint = "https://youtu.be/…"
+        input.hint = "YouTube লিংক পেস্ট করুন"
         input.setSingleLine(true)
-        input.setTextColor(Color.WHITE)
-        input.setHintTextColor(getColor(R.color.textDim))
+        input.setTextColor(textC)
+        input.setHintTextColor(dimC)
         input.textSize = 15f
-        val ilp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-        ilp.topMargin = dp(14f).toInt()
-        input.layoutParams = ilp
-
+        input.background = rounded(surface2, 12f)
+        input.setPadding(pad, dp(12f).toInt(), pad, dp(12f).toInt())
+        input.layoutParams = LinearLayout.LayoutParams(0, wrap, 1f)
         val paste = Button(this)
-        paste.text = "📋 পেস্ট করুন"
-        styleButton(paste, getColor(R.color.surface2))
-        val plp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(46f).toInt())
-        plp.topMargin = dp(8f).toInt()
+        paste.text = "📋"
+        styleButton(paste, surface2)
+        val plp = LinearLayout.LayoutParams(dp(56f).toInt(), dp(48f).toInt())
+        plp.leftMargin = dp(8f).toInt()
         paste.layoutParams = plp
         paste.setOnClickListener {
             val c = clipText().trim()
             if (c.isEmpty()) input.error = "ক্লিপবোর্ডে কোনো লেখা নেই" else input.setText(c)
         }
+        row.addView(input)
+        row.addView(paste)
 
-        box.addView(info)
-        box.addView(input)
-        box.addView(paste)
+        val play = Button(this)
+        play.text = "▶ চালান"
+        styleButton(play, 0xFF9F1239.toInt())
+        val playLp = LinearLayout.LayoutParams(match, dp(48f).toInt())
+        playLp.setMargins(pad, dp(10f).toInt(), pad, 0)
+        play.layoutParams = playLp
+        play.setOnClickListener {
+            val link = parseYtLink(input.text.toString())
+            if (link == null) {
+                input.error = "এটা YouTube ভিডিওর লিংক নয়"
+            } else {
+                dlg.dismiss()
+                openYoutube(link)
+            }
+        }
+
+        val tip = TextView(this)
+        tip.text = "ভিডিও নামাতে হবে না, সরাসরি চলবে। আরও সহজ: YouTube অ্যাপে ভিডিওর নিচে “শেয়ার” চেপে “বাংলা ভয়েস প্লেয়ার” বাছুন।"
+        tip.setTextColor(dimC)
+        tip.textSize = 13f
+        tip.setPadding(pad, dp(10f).toInt(), pad, dp(4f).toInt())
+
+        // আগে দেখা ভিডিওর তালিকা
+        val hHead = LinearLayout(this)
+        hHead.orientation = LinearLayout.HORIZONTAL
+        hHead.gravity = Gravity.CENTER_VERTICAL
+        hHead.setPadding(pad, dp(14f).toInt(), pad / 2, dp(4f).toInt())
+        val hTitle = TextView(this)
+        hTitle.setTextColor(textC)
+        hTitle.textSize = 16f
+        hTitle.setTypeface(hTitle.typeface, android.graphics.Typeface.BOLD)
+        hTitle.layoutParams = LinearLayout.LayoutParams(0, wrap, 1f)
+        val clearAll = TextView(this)
+        clearAll.text = "🗑 সব মুছুন"
+        clearAll.setTextColor(0xFFF87171.toInt())
+        clearAll.textSize = 14f
+        clearAll.setPadding(dp(10f).toInt(), dp(10f).toInt(), dp(10f).toInt(), dp(10f).toInt())
+        hHead.addView(hTitle)
+        hHead.addView(clearAll)
+
+        val scroll = ScrollView(this)
+        scroll.layoutParams = LinearLayout.LayoutParams(match, 0, 1f)
+        val list = LinearLayout(this)
+        list.orientation = LinearLayout.VERTICAL
+        list.setPadding(0, 0, 0, pad)
+        scroll.addView(list)
+
+        fun fill() {
+            list.removeAllViews()
+            val items = ytHistLoad()
+            hTitle.text = "🕘 আগে দেখা ভিডিও (" + bn(items.size.toString()) + ")"
+            clearAll.visibility = if (items.isEmpty()) View.GONE else View.VISIBLE
+            if (items.isEmpty()) {
+                val e = TextView(this)
+                e.text = "এখনো কোনো YouTube ভিডিও দেখা হয়নি। লিংক দিয়ে বা শেয়ার করে খুললে এখানে জমা থাকবে।"
+                e.setTextColor(dimC)
+                e.textSize = 14f
+                e.setPadding(pad, pad, pad, pad)
+                list.addView(e)
+                return
+            }
+            for (h in items) {
+                val r = LinearLayout(this)
+                r.orientation = LinearLayout.HORIZONTAL
+                r.gravity = Gravity.CENTER_VERTICAL
+                r.setPadding(pad, dp(8f).toInt(), dp(4f).toInt(), dp(8f).toInt())
+                val texts = LinearLayout(this)
+                texts.orientation = LinearLayout.VERTICAL
+                texts.layoutParams = LinearLayout.LayoutParams(0, wrap, 1f)
+                val t1 = TextView(this)
+                t1.text = (if (h.vertical) "📱 " else "▶ ") + (if (h.title.isNotEmpty()) h.title else "YouTube ভিডিও")
+                t1.setTextColor(textC)
+                t1.textSize = 15f
+                t1.maxLines = 2
+                t1.ellipsize = TextUtils.TruncateAt.END
+                val t2 = TextView(this)
+                t2.text = timeLabel(h.at) + "  ·  " + h.id
+                t2.setTextColor(dimC)
+                t2.textSize = 12.5f
+                t2.maxLines = 1
+                t2.setPadding(0, dp(3f).toInt(), 0, 0)
+                texts.addView(t1)
+                texts.addView(t2)
+                // নাম ছুঁলে আবার চালু
+                texts.setOnClickListener {
+                    dlg.dismiss()
+                    openYoutube(YtLink(h.id, 0L, h.vertical))
+                }
+                val del = TextView(this)
+                del.text = "🗑"
+                del.textSize = 19f
+                del.gravity = Gravity.CENTER
+                del.layoutParams = LinearLayout.LayoutParams(dp(48f).toInt(), dp(48f).toInt())
+                del.setOnClickListener {
+                    ytHistRemove(h.id)
+                    fill()
+                }
+                r.addView(texts)
+                r.addView(del)
+                list.addView(r)
+                val line = View(this)
+                line.setBackgroundColor(0x1FFFFFFF)
+                val llp = LinearLayout.LayoutParams(match, 1)
+                llp.setMargins(pad, 0, pad, 0)
+                line.layoutParams = llp
+                list.addView(line)
+            }
+        }
+        fill()
+
+        clearAll.setOnClickListener {
+            AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+                .setTitle("🗑 সব ইতিহাস মুছবেন?")
+                .setMessage("আগে দেখা সব YouTube ভিডিওর তালিকা মুছে যাবে।")
+                .setPositiveButton("মুছুন") { _, _ ->
+                    ytHistClear()
+                    fill()
+                }
+                .setNegativeButton("না", null)
+                .show()
+        }
+
+        box.addView(head)
+        box.addView(row)
+        box.addView(play)
+        box.addView(tip)
+        box.addView(hHead)
+        box.addView(scroll)
+        dlg.setContentView(box)
 
         // কপি করা লিংক থাকলে নিজে থেকেই বসে যাবে
         val copied = clipText().trim()
         if (parseYtLink(copied) != null) input.setText(copied)
-
-        val dlg = AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
-            .setTitle("▶ YouTube ভিডিও চালান")
-            .setView(box)
-            .setPositiveButton("▶ চালান", null)
-            .setNegativeButton("বাতিল", null)
-            .create()
-        dlg.setOnShowListener {
-            dlg.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
-                val link = parseYtLink(input.text.toString())
-                if (link == null) {
-                    input.error = "এটা YouTube ভিডিওর লিংক নয়"
-                } else {
-                    dlg.dismiss()
-                    openYoutube(link)
-                }
-            }
-        }
         dlg.show()
+    }
+
+    // ---------- আগে দেখা YouTube ভিডিওর ইতিহাস (ফোনেই জমা থাকে) ----------
+
+    private fun ytHistLoad(): MutableList<YtHist> {
+        val out = ArrayList<YtHist>()
+        try {
+            val arr = JSONArray(prefs.getString("ytHistory", "[]") ?: "[]")
+            for (k in 0 until arr.length()) {
+                val o = arr.optJSONObject(k) ?: continue
+                val id = o.optString("id", "")
+                if (id.length != 11) continue
+                out.add(YtHist(id, o.optString("t", ""), o.optLong("at", 0L), o.optBoolean("v", false)))
+            }
+        } catch (e: Exception) {
+        }
+        return out
+    }
+
+    private fun ytHistSave(list: List<YtHist>) {
+        try {
+            val arr = JSONArray()
+            for (h in list.take(YT_HISTORY_MAX)) {
+                val o = JSONObject()
+                o.put("id", h.id)
+                o.put("t", h.title)
+                o.put("at", h.at)
+                o.put("v", h.vertical)
+                arr.put(o)
+            }
+            prefs.edit().putString("ytHistory", arr.toString()).apply()
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun ytHistAdd(id: String, vertical: Boolean) {
+        val list = ytHistLoad()
+        val old = list.firstOrNull { it.id == id }
+        list.removeAll { it.id == id }
+        list.add(0, YtHist(id, old?.title ?: "", System.currentTimeMillis(), vertical || (old?.vertical ?: false)))
+        ytHistSave(list)
+    }
+
+    private fun ytHistTitle(id: String): String {
+        return ytHistLoad().firstOrNull { it.id == id }?.title ?: ""
+    }
+
+    private fun ytHistSetTitle(id: String, title: String) {
+        val list = ytHistLoad()
+        val h = list.firstOrNull { it.id == id } ?: return
+        if (h.title == title) return
+        h.title = title
+        ytHistSave(list)
+    }
+
+    private fun ytHistRemove(id: String) {
+        val list = ytHistLoad()
+        list.removeAll { it.id == id }
+        ytHistSave(list)
+    }
+
+    private fun ytHistClear() {
+        prefs.edit().remove("ytHistory").apply()
+    }
+
+    // "আজ দুপুর ১:২০" বা "গতকাল রাত ৯:০৫" বা তারিখ
+    private fun timeLabel(at: Long): String {
+        if (at <= 0L) return ""
+        val dayFmt = SimpleDateFormat("yyyyMMdd", Locale.US)
+        val now = System.currentTimeMillis()
+        val d = dayFmt.format(Date(at))
+        val day = if (d == dayFmt.format(Date(now))) {
+            "আজ"
+        } else if (d == dayFmt.format(Date(now - 86400000L))) {
+            "গতকাল"
+        } else {
+            bn(SimpleDateFormat("dd/MM/yyyy", Locale.US).format(Date(at)))
+        }
+        val hm = SimpleDateFormat("H:mm", Locale.US).format(Date(at))
+        val h = hm.substringBefore(':').toIntOrNull() ?: 0
+        val part = when (h) {
+            in 4..5 -> "ভোর"
+            in 6..11 -> "সকাল"
+            in 12..15 -> "দুপুর"
+            in 16..17 -> "বিকেল"
+            in 18..19 -> "সন্ধ্যা"
+            else -> "রাত"
+        }
+        val h12 = if (h % 12 == 0) 12 else h % 12
+        return day + " " + part + " " + bn(h12.toString() + ":" + hm.substringAfter(':'))
     }
 
     // YouTube অ্যাপ থেকে "শেয়ার" করে পাঠানো লিংক
@@ -2821,6 +3074,8 @@ class MainActivity : Activity() {
     private fun openYoutube(link: YtLink) {
         if (released) return
         if (isLocked) setLocked(false)
+        // আগে দেখা ভিডিওর তালিকায় জমা (সবচেয়ে নতুনটা উপরে)
+        ytHistAdd(link.id, link.vertical)
         loadYoutube(link.id, link.startMs, link.vertical)
         flash(if (cues.isEmpty()) "▶ YouTube ভিডিও খোলা হচ্ছে… এখন বাংলা SRT বেছে নিন" else "▶ YouTube ভিডিও খোলা হচ্ছে…")
     }
@@ -2914,8 +3169,10 @@ class MainActivity : Activity() {
         // ঠিকানাটা অ্যাপের নিজের পরিচয় (com.banglavoice.player), YouTube-এর নিয়ম অনুযায়ী
         wv.loadDataWithBaseURL(YT_BASE_URL, page, "text/html", "utf-8", null)
 
-        currentVideoBase = id.lowercase(Locale.US)
-        videoName.text = "▶ YouTube: " + id
+        // আগে দেখা ভিডিও হলে নাম আগে থেকেই জানা
+        val known = ytHistTitle(id)
+        currentVideoBase = (if (known.isNotEmpty()) known else id).lowercase(Locale.US)
+        videoName.text = "▶ YouTube: " + (if (known.isNotEmpty()) known else id)
         fetchYtTitle(id, gen)
         registerNoisy()
         applyYtStripLayout()
@@ -3019,6 +3276,7 @@ class MainActivity : Activity() {
             val t = title.trim()
             if (t.isNotEmpty()) {
                 runOnUiThread {
+                    ytHistSetTitle(id, t)
                     if (gen == ytGen && ytMode) {
                         videoName.text = "▶ YouTube: " + t
                         currentVideoBase = t.lowercase(Locale.US)
@@ -3354,58 +3612,143 @@ class MainActivity : Activity() {
         }
     }
 
-    // ---------- ভিডিওর নিচের কালো পট্টি (লেখা আর বোতাম, YouTube-এর ছবির উপরে কিছু থাকে না) ----------
+    // ---------- YouTube ভিডিওর মাপ আর বোতামের জায়গা (YouTube-এর ছবির উপরে কিছু থাকে না) ----------
+    // ফুলস্ক্রিনে দুই রকম:
+    //   ফুল: ভিডিও স্ক্রিনের পুরো উচ্চতা জুড়ে মাঝখানে, বাংলা লেখা দেখায় না (শুধু কণ্ঠ), বোতাম পাশের কালো জায়গায়
+    //   হাফ: ভিডিও একটু ছোট, নিচের কালো পট্টিতে বাংলা লেখা
 
     private fun ytStripPx(): Int = dp(if (isFullscreen) 72f else 84f).toInt()
 
+    private fun ytFullNow(): Boolean = ytMode && isFullscreen && ytFullSize
+
+    private fun toggleYtSize() {
+        ytFullSize = !ytFullSize
+        prefs.edit().putBoolean("ytFullSize", ytFullSize).apply()
+        applyYtStripLayout()
+        try {
+            val msg = if (ytFullSize) "ফুল: ভিডিও বড়, বাংলা লেখা দেখাবে না, কণ্ঠ চলবে" else "হাফ: ভিডিওর নিচে বাংলা লেখা দেখাবে"
+            Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) {
+        }
+    }
+
+    // মাপ বা জায়গা না বদলালে কিছু করা হয় না (বারবার নতুন করে সাজানো এড়াতে)
+    private fun placeView(v: View, w: Int, h: Int, gravity: Int, l: Int, t: Int, r: Int, b: Int) {
+        val lp = v.layoutParams as FrameLayout.LayoutParams
+        if (lp.width == w && lp.height == h && lp.gravity == gravity &&
+            lp.leftMargin == l && lp.topMargin == t && lp.rightMargin == r && lp.bottomMargin == b
+        ) return
+        lp.width = w
+        lp.height = h
+        lp.gravity = gravity
+        lp.setMargins(l, t, r, b)
+        v.layoutParams = lp
+    }
+
+    // বোতামগুলো পাশাপাশি (পট্টিতে) নাকি একটার নিচে আরেকটা (পাশের কালো জায়গায়)
+    private fun setYtBtnsVertical(vertical: Boolean) {
+        val o = if (vertical) LinearLayout.VERTICAL else LinearLayout.HORIZONTAL
+        if (ytBtns.orientation != o) ytBtns.orientation = o
+        val gap = dp(8f).toInt()
+        val n = ytBtns.childCount
+        for (k in 0 until n) {
+            val c = ytBtns.getChildAt(k)
+            val lp = c.layoutParams as LinearLayout.LayoutParams
+            val last = k == n - 1
+            val r = if (!vertical && !last) gap else 0
+            val b = if (vertical && !last) gap else 0
+            if (lp.leftMargin != 0 || lp.topMargin != 0 || lp.rightMargin != r || lp.bottomMargin != b) {
+                lp.setMargins(0, 0, r, b)
+                c.layoutParams = lp
+            }
+        }
+    }
+
     private fun fitYt() {
         val v = ytView ?: return
+        val bw = videoBox.width
         val bh = videoBox.height
-        if (bh <= 0) return
-        val h = max(dp(150f).toInt(), bh - ytStripPx())
-        val lp = v.layoutParams as FrameLayout.LayoutParams
-        if (lp.width != ViewGroup.LayoutParams.MATCH_PARENT || lp.height != h || lp.gravity != Gravity.TOP) {
-            lp.width = ViewGroup.LayoutParams.MATCH_PARENT
-            lp.height = h
-            lp.gravity = Gravity.TOP
-            v.layoutParams = lp
+        if (bw <= 0 || bh <= 0) return
+        val btn = dp(44f).toInt()
+        val edge = dp(6f).toInt()
+        val wrap = ViewGroup.LayoutParams.WRAP_CONTENT
+        if (ytFullNow()) {
+            val a = if (ytVertical) 9f / 16f else 16f / 9f
+            val room = dp(72f)
+            var vw = bw.toFloat()
+            var vh = vw / a
+            if (vh > bh) {
+                vh = bh.toFloat()
+                vw = vh * a
+            }
+            if ((bw - vw) / 2f < room && bh - vh < room) {
+                // বোতামের জায়গা নেই: ভিডিও সামান্য ছোট করে পাশে জায়গা রাখা
+                if (a >= 1f) {
+                    vw = bw - 2f * room
+                    vh = vw / a
+                } else {
+                    vh = bh - room
+                    vw = vh * a
+                }
+            }
+            val w = vw.roundToInt()
+            val h = vh.roundToInt()
+            val side = (bw - w) / 2
+            if (side.toFloat() + 1f >= room) {
+                // শোয়ানো ভিডিও: মাঝখানে, বোতাম ডানে-বামের কালো জায়গায় নিচের দিকে
+                placeView(v, w, h, Gravity.CENTER, 0, 0, 0, 0)
+                val inset = max(0, (side - btn) / 2)
+                val bottom = dp(16f).toInt()
+                setYtBtnsVertical(true)
+                placeView(lockBtn, btn, btn, Gravity.BOTTOM or Gravity.START, inset, 0, 0, bottom)
+                placeView(ytBtns, wrap, wrap, Gravity.BOTTOM or Gravity.END, 0, 0, inset, bottom)
+            } else {
+                // খাড়া ভিডিও: উপরে, বোতাম নিচের কালো জায়গায়
+                placeView(v, w, h, Gravity.TOP or Gravity.CENTER_HORIZONTAL, 0, 0, 0, 0)
+                val bottom = max(0, (bh - h - btn) / 2)
+                setYtBtnsVertical(false)
+                placeView(lockBtn, btn, btn, Gravity.BOTTOM or Gravity.START, edge, 0, 0, bottom)
+                placeView(ytBtns, wrap, wrap, Gravity.BOTTOM or Gravity.END, 0, 0, edge, bottom)
+            }
+        } else {
+            // হাফ আর সাধারণ স্ক্রিন: ভিডিও উপরে, নিচে লেখার পট্টি
+            val strip = ytStripPx()
+            val h = max(dp(150f).toInt(), bh - strip)
+            placeView(v, ViewGroup.LayoutParams.MATCH_PARENT, h, Gravity.TOP, 0, 0, 0, 0)
+            val bottom = max(0, (strip - btn) / 2)
+            setYtBtnsVertical(false)
+            placeView(lockBtn, btn, btn, Gravity.BOTTOM or Gravity.START, edge, 0, 0, bottom)
+            placeView(ytBtns, wrap, wrap, Gravity.BOTTOM or Gravity.END, 0, 0, edge, bottom)
         }
     }
 
     private fun applyYtStripLayout() {
-        val strip = ytStripPx()
-        val btn = dp(44f).toInt()
-        val m = dp(4f).toInt()
-        val left = dp(56f).toInt()
-        val right = dp(if (isFullscreen) 108f else 56f).toInt()
-        val slp = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, strip - 2 * m)
-        slp.gravity = Gravity.BOTTOM
-        slp.setMargins(left, m, right, m)
-        subtitleView.layoutParams = slp
         subtitleView.translationY = 0f
-        subtitleView.background = null
-        subtitleView.setPadding(dp(4f).toInt(), 0, dp(4f).toInt(), 0)
-        if (Build.VERSION.SDK_INT >= 26) {
-            // লেখা লম্বা হলে নিজে থেকে একটু ছোট হয়ে পট্টির ভেতরেই থাকবে
-            subtitleView.setAutoSizeTextTypeUniformWithConfiguration(11, if (isFullscreen) 20 else 17, 1, TypedValue.COMPLEX_UNIT_SP)
-        } else {
-            subtitleView.textSize = if (isFullscreen) 17f else 15f
-            subtitleView.maxLines = 3
-        }
-        val llp = FrameLayout.LayoutParams(btn, btn)
-        llp.gravity = Gravity.BOTTOM or Gravity.START
-        llp.setMargins(dp(6f).toInt(), 0, 0, (strip - btn) / 2)
-        lockBtn.layoutParams = llp
-        lockBtn.background = rounded(0x33FFFFFF, 22f)
-        val blp = ytBtns.layoutParams as FrameLayout.LayoutParams
-        blp.gravity = Gravity.BOTTOM or Gravity.END
-        blp.setMargins(0, 0, dp(6f).toInt(), (strip - btn) / 2)
-        ytBtns.layoutParams = blp
-        ytBtns.visibility = if (isLocked) View.GONE else View.VISIBLE
-        ytMuteBtn.visibility = if (isFullscreen) View.VISIBLE else View.GONE
-        ytFullBtn.text = if (isFullscreen) "✕" else "📺"
         fsBar.visibility = View.GONE
         exitFull.visibility = View.GONE
+        lockBtn.background = rounded(0x33FFFFFF, 22f)
+        ytBtns.visibility = if (isLocked) View.GONE else View.VISIBLE
+        ytSizeBtn.visibility = if (isFullscreen) View.VISIBLE else View.GONE
+        ytMuteBtn.visibility = if (isFullscreen) View.VISIBLE else View.GONE
+        // বোতামে লেখা থাকে কোনটায় যাবেন
+        ytSizeBtn.text = if (ytFullSize) "হাফ" else "ফুল"
+        ytFullBtn.text = if (isFullscreen) "✕" else "📺"
+        if (!ytFullNow()) {
+            val strip = ytStripPx()
+            val m = dp(4f).toInt()
+            val left = dp(56f).toInt()
+            val right = dp(if (isFullscreen) 168f else 56f).toInt()
+            placeView(subtitleView, ViewGroup.LayoutParams.MATCH_PARENT, strip - 2 * m, Gravity.BOTTOM, left, m, right, m)
+            subtitleView.background = null
+            subtitleView.setPadding(dp(4f).toInt(), 0, dp(4f).toInt(), 0)
+            if (Build.VERSION.SDK_INT >= 26) {
+                // লেখা লম্বা হলে নিজে থেকে একটু ছোট হয়ে পট্টির ভেতরেই থাকবে
+                subtitleView.setAutoSizeTextTypeUniformWithConfiguration(11, if (isFullscreen) 20 else 17, 1, TypedValue.COMPLEX_UNIT_SP)
+            } else {
+                subtitleView.textSize = if (isFullscreen) 17f else 15f
+                subtitleView.maxLines = 3
+            }
+        }
         lastShownIdx = -2
         fitYt()
     }
